@@ -118,7 +118,7 @@ def help : Flag<["-", "--"], "help">,
   HelpText<"Display available options">;
 def h : Flag<["-"], "h">, Alias<help>;
 def help_hidden : Flag<["-", "--"], "help-hidden">,
-  Flags<[HelpHidden, FrontendOption]>,
+  Flags<[FrontendOption]>,
   HelpText<"Display available options, including hidden options">;
 
 def v : Flag<["-"], "v">, Flags<[DoesNotAffectIncrementalBuild]>,
