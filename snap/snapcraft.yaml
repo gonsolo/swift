@@ -1,4 +1,4 @@
-name: swift
+name: swift5
 version: '5.1.1'
 summary: The Swift Programming Language
 description: |
@@ -10,7 +10,7 @@ confinement: strict
 grade: devel
 
 parts:
-  swift:
+  swift5:
     source: https://swift.org/builds/swift-5.1.1-release/ubuntu1804/swift-5.1.1-RELEASE/swift-5.1.1-RELEASE-ubuntu18.04.tar.gz
     stage-packages:
       - clang
