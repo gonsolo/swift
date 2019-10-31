@@ -14,7 +14,7 @@ architectures:
     run-on: amd64
 
 parts:
-  swift5:
+  swift:
     source: https://swift.org/builds/swift-5.1.1-release/ubuntu1804/swift-5.1.1-RELEASE/swift-5.1.1-RELEASE-ubuntu18.04.tar.gz
     stage-packages:
       - clang
