@@ -14,23 +14,40 @@
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/Basic/NullablePtr.h"
+#include "swift/Basic/STLExtras.h"
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/Projection.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBasicBlock.h"
+#include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILVisitor.h"
 
 using namespace swift;
 
+SILValue swift::stripOwnershipInsts(SILValue v) {
+  while (true) {
+    switch (v->getKind()) {
+    default:
+      return v;
+    case ValueKind::CopyValueInst:
+    case ValueKind::BeginBorrowInst:
+      v = cast<SingleValueInstruction>(v)->getOperand(0);
+    }
+  }
+}
+
 /// Strip off casts/indexing insts/address projections from V until there is
 /// nothing left to strip.
 /// FIXME: Why don't we strip projections after stripping indexes?
-SILValue swift::getUnderlyingObject(SILValue V) {
+SILValue swift::getUnderlyingObject(SILValue v) {
   while (true) {
-    SILValue V2 = stripIndexingInsts(stripAddressProjections(stripCasts(V)));
-    if (V2 == V)
-      return V2;
-    V = V2;
+    SILValue v2 = stripCasts(v);
+    v2 = stripAddressProjections(v2);
+    v2 = stripIndexingInsts(v2);
+    v2 = stripOwnershipInsts(v2);
+    if (v2 == v)
+      return v2;
+    v = v2;
   }
 }
 
@@ -56,12 +73,15 @@ SILValue swift::getUnderlyingAddressRoot(SILValue V) {
 }
 
 
-SILValue swift::getUnderlyingObjectStopAtMarkDependence(SILValue V) {
+SILValue swift::getUnderlyingObjectStopAtMarkDependence(SILValue v) {
   while (true) {
-    SILValue V2 = stripIndexingInsts(stripAddressProjections(stripCastsWithoutMarkDependence(V)));
-    if (V2 == V)
-      return V2;
-    V = V2;
+    SILValue v2 = stripCastsWithoutMarkDependence(v);
+    v2 = stripAddressProjections(v2);
+    v2 = stripIndexingInsts(v2);
+    v2 = stripOwnershipInsts(v2);
+    if (v2 == v)
+      return v2;
+    v = v2;
   }
 }
 
@@ -138,47 +158,68 @@ SILValue swift::stripCastsWithoutMarkDependence(SILValue V) {
   }
 }
 
-SILValue swift::stripCasts(SILValue V) {
+SILValue swift::stripCasts(SILValue v) {
   while (true) {
-    V = stripSinglePredecessorArgs(V);
+    v = stripSinglePredecessorArgs(v);
     
-    auto K = V->getKind();
-    if (isRCIdentityPreservingCast(K)
-        || K == ValueKind::UncheckedTrivialBitCastInst
-        || K == ValueKind::MarkDependenceInst) {
-      V = cast<SingleValueInstruction>(V)->getOperand(0);
+    auto k = v->getKind();
+    if (isRCIdentityPreservingCast(k)
+        || k == ValueKind::UncheckedTrivialBitCastInst
+        || k == ValueKind::MarkDependenceInst) {
+      v = cast<SingleValueInstruction>(v)->getOperand(0);
       continue;
     }
-    
-    return V;
+
+    SILValue v2 = stripOwnershipInsts(v);
+    if (v2 != v) {
+      v = v2;
+      continue;
+    }
+
+    return v;
   }
 }
 
-SILValue swift::stripUpCasts(SILValue V) {
-  assert(V->getType().isClassOrClassMetatype() &&
+SILValue swift::stripUpCasts(SILValue v) {
+  assert(v->getType().isClassOrClassMetatype() &&
          "Expected class or class metatype!");
   
-  V = stripSinglePredecessorArgs(V);
+  v = stripSinglePredecessorArgs(v);
   
-  while (auto upcast = dyn_cast<UpcastInst>(V))
-    V = stripSinglePredecessorArgs(upcast->getOperand());
-  
-  return V;
+  while (true) {
+    if (auto *ui = dyn_cast<UpcastInst>(v)) {
+      v = ui->getOperand();
+      continue;
+    }
+
+    SILValue v2 = stripSinglePredecessorArgs(v);
+    v2 = stripOwnershipInsts(v2);
+    if (v2 == v) {
+      return v2;
+    }
+    v = v2;
+  }
 }
 
-SILValue swift::stripClassCasts(SILValue V) {
+SILValue swift::stripClassCasts(SILValue v) {
   while (true) {
-    if (auto *UI = dyn_cast<UpcastInst>(V)) {
-      V = UI->getOperand();
+    if (auto *ui = dyn_cast<UpcastInst>(v)) {
+      v = ui->getOperand();
       continue;
     }
     
-    if (auto *UCCI = dyn_cast<UnconditionalCheckedCastInst>(V)) {
-      V = UCCI->getOperand();
+    if (auto *ucci = dyn_cast<UnconditionalCheckedCastInst>(v)) {
+      v = ucci->getOperand();
       continue;
     }
-    
-    return V;
+
+    SILValue v2 = stripOwnershipInsts(v);
+    if (v2 != v) {
+      v = v2;
+      continue;
+    }
+
+    return v;
   }
 }
 
@@ -200,18 +241,6 @@ SILValue swift::stripAddressProjections(SILValue V) {
     if (!Projection::isAddressProjection(V))
       return V;
     V = cast<SingleValueInstruction>(V)->getOperand(0);
-  }
-}
-
-SILValue swift::stripUnaryAddressProjections(SILValue V) {
-  while (true) {
-    V = stripSinglePredecessorArgs(V);
-    if (!Projection::isAddressProjection(V))
-      return V;
-    auto *Inst = cast<SingleValueInstruction>(V);
-    if (Inst->getNumOperands() > 1)
-      return V;
-    V = Inst->getOperand(0);
   }
 }
 
@@ -247,6 +276,11 @@ SILValue swift::stripBorrow(SILValue V) {
   return V;
 }
 
+// All instructions handled here must propagate their first operand into their
+// single result.
+//
+// This is guaranteed to handle all function-type converstions: ThinToThick,
+// ConvertFunction, and ConvertEscapeToNoEscapeInst.
 SingleValueInstruction *swift::getSingleValueCopyOrCast(SILInstruction *I) {
   if (auto *convert = dyn_cast<ConversionInst>(I))
     return convert;
@@ -259,6 +293,7 @@ SingleValueInstruction *swift::getSingleValueCopyOrCast(SILInstruction *I) {
   case SILInstructionKind::CopyBlockWithoutEscapingInst:
   case SILInstructionKind::BeginBorrowInst:
   case SILInstructionKind::BeginAccessInst:
+  case SILInstructionKind::MarkDependenceInst:
     return cast<SingleValueInstruction>(I);
   }
 }
@@ -291,35 +326,44 @@ bool swift::onlyAffectsRefCount(SILInstruction *user) {
   case SILInstructionKind::StrongReleaseInst:
   case SILInstructionKind::StrongRetainInst:
   case SILInstructionKind::UnmanagedAutoreleaseValueInst:
-  case SILInstructionKind::UnmanagedReleaseValueInst:
-  case SILInstructionKind::UnmanagedRetainValueInst:
-  case SILInstructionKind::UnownedReleaseInst:
-  case SILInstructionKind::UnownedRetainInst:
+#define UNCHECKED_REF_STORAGE(Name, ...)                                       \
+  case SILInstructionKind::Name##RetainValueInst:                              \
+  case SILInstructionKind::Name##ReleaseValueInst:                             \
+  case SILInstructionKind::StrongCopy##Name##ValueInst:
+#define ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...)            \
+  case SILInstructionKind::Name##RetainInst:                                   \
+  case SILInstructionKind::Name##ReleaseInst:                                  \
+  case SILInstructionKind::StrongRetain##Name##Inst:                           \
+  case SILInstructionKind::StrongCopy##Name##ValueInst:
+#include "swift/AST/ReferenceStorage.def"
     return true;
   }
 }
 
-SILValue swift::stripConvertFunctions(SILValue V) {
-  while (true) {
-    if (auto CFI = dyn_cast<ConvertFunctionInst>(V)) {
-      V = CFI->getOperand();
-      continue;
-    }
-    else if (auto *Cvt = dyn_cast<ConvertEscapeToNoEscapeInst>(V)) {
-      V = Cvt->getOperand();
-      continue;
-    }
-    break;
-  }
-  return V;
+bool swift::mayCheckRefCount(SILInstruction *User) {
+  return isa<IsUniqueInst>(User) || isa<IsEscapingClosureInst>(User);
 }
 
+bool swift::isSanitizerInstrumentation(SILInstruction *Instruction) {
+  auto *BI = dyn_cast<BuiltinInst>(Instruction);
+  if (!BI)
+    return false;
+
+  Identifier Name = BI->getName();
+  if (Name == BI->getModule().getASTContext().getIdentifier("tsanInoutAccess"))
+    return true;
+
+  return false;
+}
 
 SILValue swift::isPartialApplyOfReabstractionThunk(PartialApplyInst *PAI) {
-  if (PAI->getNumArguments() != 1)
+  // A partial_apply of a reabstraction thunk either has a single capture
+  // (a function) or two captures (function and dynamic Self type).
+  if (PAI->getNumArguments() != 1 &&
+      PAI->getNumArguments() != 2)
     return SILValue();
 
-  auto *Fun = PAI->getReferencedFunction();
+  auto *Fun = PAI->getReferencedFunctionOrNull();
   if (!Fun)
     return SILValue();
 
@@ -338,11 +382,30 @@ SILValue swift::isPartialApplyOfReabstractionThunk(PartialApplyInst *PAI) {
   return Arg;
 }
 
-/// Given a block used as a noescape function argument, attempt to find
-/// the Swift closure that invoking the block will call.
+bool swift::onlyUsedByAssignByWrapper(PartialApplyInst *PAI) {
+  bool usedByAssignByWrapper = false;
+  for (Operand *Op : PAI->getUses()) {
+    SILInstruction *User = Op->getUser();
+    if (isa<AssignByWrapperInst>(User) && Op->getOperandNumber() >= 2) {
+      usedByAssignByWrapper = true;
+      continue;
+    }
+    if (isa<DestroyValueInst>(User))
+      continue;
+    return false;
+  }
+  return usedByAssignByWrapper;
+}
+
+/// Given a block used as a noescape function argument, attempt to find all
+/// Swift closures that invoking the block will call. The StoredClosures may not
+/// actually be partial_apply instructions. They may be copied, block arguments,
+/// or conversions. The caller must continue searching up the use-def chain.
 static SILValue findClosureStoredIntoBlock(SILValue V) {
+
   auto FnType = V->getType().castTo<SILFunctionType>();
   assert(FnType->getRepresentation() == SILFunctionTypeRepresentation::Block);
+  (void)FnType;
 
   // Given a no escape block argument to a function,
   // pattern match to find the noescape closure that invoking the block
@@ -358,24 +421,7 @@ static SILValue findClosureStoredIntoBlock(SILValue V) {
   //     %block = init_block_storage_header %storage invoke %thunk
   //     %arg = copy_block %block
 
-  InitBlockStorageHeaderInst *IBSHI = nullptr;
-
-  // Look through block copies to find the initialization of block storage.
-  while (true) {
-    if (auto *CBI = dyn_cast<CopyBlockInst>(V)) {
-      V = CBI->getOperand();
-      continue;
-    }
-
-    if (auto *CBI = dyn_cast<CopyBlockWithoutEscapingInst>(V)) {
-      V = CBI->getBlock();
-      continue;
-    }
-
-    IBSHI = dyn_cast<InitBlockStorageHeaderInst>(V);
-    break;
-  }
-
+  InitBlockStorageHeaderInst *IBSHI = dyn_cast<InitBlockStorageHeaderInst>(V);
   if (!IBSHI)
     return nullptr;
 
@@ -398,132 +444,236 @@ static SILValue findClosureStoredIntoBlock(SILValue V) {
   auto NoEscapeClosure = isPartialApplyOfReabstractionThunk(Sentinel);
   if (WrappedNoEscape->getBase() != NoEscapeClosure)
     return nullptr;
+
+  // This is the value of the closure to be invoked. To find the partial_apply
+  // itself, the caller must search the use-def chain.
   return NoEscapeClosure;
 }
 
-/// Look through a value passed as a function argument to determine whether
-/// it is a closure.
+/// Find all closures that may be propagated into the given function-type value.
 ///
-/// Return the partial_apply and a flag set to true if the closure is
-/// indirectly captured by a reabstraction thunk.
-FindClosureResult swift::findClosureForAppliedArg(SILValue V) {
-  // Look through borrows.
-  if (auto *bbi = dyn_cast<BeginBorrowInst>(V))
-    V = bbi->getOperand();
+/// Searches the use-def chain from the given value upward until a partial_apply
+/// is reached. Populates `results` with the set of partial_apply instructions.
+///
+/// `funcVal` may be either a function type or an Optional function type. This
+/// might be called on a directly applied value or on a call argument, which may
+/// in turn be applied within the callee.
+void swift::findClosuresForFunctionValue(
+    SILValue funcVal, TinyPtrVector<PartialApplyInst *> &results) {
 
-  if (V->getType().getOptionalObjectType()) {
-    auto *EI = dyn_cast<EnumInst>(V);
-    if (!EI || !EI->hasOperand())
-      return FindClosureResult(nullptr, false);
+  SILType funcTy = funcVal->getType();
+  // Handle `Optional<@convention(block) @noescape (_)->(_)>`
+  if (auto optionalObjTy = funcTy.getOptionalObjectType())
+    funcTy = optionalObjTy;
+  assert(funcTy.is<SILFunctionType>());
 
-    V = EI->getOperand();
+  SmallVector<SILValue, 4> worklist;
+  // Avoid exponential path exploration and prevent duplicate results.
+  llvm::SmallDenseSet<SILValue, 8> visited;
+  auto worklistInsert = [&](SILValue V) {
+    if (visited.insert(V).second)
+      worklist.push_back(V);
+  };
+  worklistInsert(funcVal);
+
+  while (!worklist.empty()) {
+    SILValue V = worklist.pop_back_val();
+
+    if (auto *I = V->getDefiningInstruction()) {
+      // Look through copies, borrows, and conversions.
+      //
+      // Handle copy_block and copy_block_without_actually_escaping before
+      // calling findClosureStoredIntoBlock.
+      if (SingleValueInstruction *SVI = getSingleValueCopyOrCast(I)) {
+        worklistInsert(SVI->getOperand(0));
+        continue;
+      }
+    }
+    // Look through Optionals.
+    if (V->getType().getOptionalObjectType()) {
+      auto *EI = dyn_cast<EnumInst>(V);
+      if (EI && EI->hasOperand()) {
+        worklistInsert(EI->getOperand());
+      }
+      // Ignore the .None case.
+      continue;
+    }
+    // Look through Phis.
+    //
+    // This should be done before calling findClosureStoredIntoBlock.
+    if (auto *arg = dyn_cast<SILPhiArgument>(V)) {
+      SmallVector<std::pair<SILBasicBlock *, SILValue>, 2> blockArgs;
+      arg->getIncomingPhiValues(blockArgs);
+      for (auto &blockAndArg : blockArgs)
+        worklistInsert(blockAndArg.second);
+
+      continue;
+    }
+    // Look through ObjC closures.
+    auto fnType = V->getType().getAs<SILFunctionType>();
+    if (fnType
+        && fnType->getRepresentation() == SILFunctionTypeRepresentation::Block) {
+      if (SILValue storedClosure = findClosureStoredIntoBlock(V))
+        worklistInsert(storedClosure);
+
+      continue;
+    }
+    if (auto *PAI = dyn_cast<PartialApplyInst>(V)) {
+      SILValue thunkArg = isPartialApplyOfReabstractionThunk(PAI);
+      if (thunkArg) {
+        // Handle reabstraction thunks recursively. This may reabstract over
+        // @convention(block).
+        worklistInsert(thunkArg);
+        continue;
+      }
+      results.push_back(PAI);
+      continue;
+    }
+    // Ignore other unrecognized values that feed this applied argument.
   }
-
-  auto fnType = V->getType().getAs<SILFunctionType>();
-  if (fnType->getRepresentation() == SILFunctionTypeRepresentation::Block) {
-    V = findClosureStoredIntoBlock(V);
-    if (!V)
-      return FindClosureResult(nullptr, false);
-  }
-  auto *PAI = dyn_cast<PartialApplyInst>(stripConvertFunctions(V));
-  if (!PAI)
-    return FindClosureResult(nullptr, false);
-
-  SILValue thunkArg = isPartialApplyOfReabstractionThunk(PAI);
-  if (thunkArg) {
-    // Handle reabstraction thunks recursively. This may reabstract over
-    // @convention(block).
-    auto result = findClosureForAppliedArg(thunkArg);
-    return FindClosureResult(result.PAI, true);
-  }
-  return FindClosureResult(PAI, false);
 }
 
-namespace {
+bool PolymorphicBuiltinSpecializedOverloadInfo::init(
+    SILFunction *fn, BuiltinValueKind builtinKind,
+    ArrayRef<SILType> oldOperandTypes, SILType oldResultType) {
+  assert(!isInitialized && "Expected uninitialized info");
+  SWIFT_DEFER { isInitialized = true; };
+  if (!isPolymorphicBuiltin(builtinKind))
+    return false;
 
-enum class OwnershipQualifiedKind {
-  NotApplicable,
-  Qualified,
-  Unqualified,
-};
+  // Ok, at this point we know that we have a true polymorphic builtin. See if
+  // we have an overload for its current operand type.
+  StringRef name = getBuiltinName(builtinKind);
+  StringRef prefix = "generic_";
+  assert(name.startswith(prefix) &&
+         "Invalid polymorphic builtin name! Prefix should be Generic$OP?!");
+  SmallString<32> staticOverloadName;
+  staticOverloadName.append(name.drop_front(prefix.size()));
 
-struct OwnershipQualifiedKindVisitor : SILInstructionVisitor<OwnershipQualifiedKindVisitor, OwnershipQualifiedKind> {
-
-  OwnershipQualifiedKind visitSILInstruction(SILInstruction *I) {
-    return OwnershipQualifiedKind::NotApplicable;
-  }
-
-#define QUALIFIED_INST(CLASS) \
-  OwnershipQualifiedKind visit ## CLASS(CLASS *I) { \
-    return OwnershipQualifiedKind::Qualified;             \
-  }
-  QUALIFIED_INST(EndBorrowInst)
-  QUALIFIED_INST(LoadBorrowInst)
-  QUALIFIED_INST(CopyValueInst)
-  QUALIFIED_INST(CopyUnownedValueInst)
-  QUALIFIED_INST(DestroyValueInst)
-#undef QUALIFIED_INST
-
-  OwnershipQualifiedKind visitLoadInst(LoadInst *LI) {
-    if (LI->getOwnershipQualifier() == LoadOwnershipQualifier::Unqualified)
-      return OwnershipQualifiedKind::Unqualified;
-    return OwnershipQualifiedKind::Qualified;
-  }
-
-  OwnershipQualifiedKind visitStoreInst(StoreInst *SI) {
-    if (SI->getOwnershipQualifier() == StoreOwnershipQualifier::Unqualified)
-      return OwnershipQualifiedKind::Unqualified;
-    return OwnershipQualifiedKind::Qualified;
-  }
-};
-
-} // end anonymous namespace
-
-bool FunctionOwnershipEvaluator::evaluate(SILInstruction *I) {
-  assert(I->getFunction() == F.get() && "Can not evaluate function ownership "
-         "implications of an instruction that "
-         "does not belong to the instruction "
-         "that we are evaluating");
-
-  switch (OwnershipQualifiedKindVisitor().visit(I)) {
-  case OwnershipQualifiedKind::Unqualified: {
-    // If we already know that the function has unqualified ownership, just
-    // return early.
-    if (!F.get()->hasQualifiedOwnership())
-      return true;
-
-    // Ok, so we know at this point that we have qualified ownership. If we have
-    // seen any instructions with qualified ownership, we have an error since
-    // the function mixes qualified and unqualified instructions.
-    if (HasOwnershipQualifiedInstruction)
+  // If our first argument is an address, we know we have an indirect @out
+  // parameter by convention since all of these polymorphic builtins today never
+  // take indirect parameters without an indirect out result parameter. We stash
+  // this information and validate that if we have an out param, that our result
+  // is equal to the empty tuple type.
+  if (oldOperandTypes[0].isAddress()) {
+    if (oldResultType != fn->getModule().Types.getEmptyTupleType())
       return false;
 
-    // Otherwise, set the function to have unqualified ownership. This will
-    // ensure that no more Qualified instructions can be added to the given
-    // function.
-    F.get()->setUnqualifiedOwnership();
-    return true;
-  }
-  case OwnershipQualifiedKind::Qualified: {
-    // First check if our function has unqualified ownership. If we already do
-    // have unqualified ownership, then we know that we have already seen an
-    // unqualified ownership instruction. This means the function has both
-    // qualified and unqualified instructions. =><=.
-    if (!F.get()->hasQualifiedOwnership())
+    hasOutParam = true;
+    SILType firstType = oldOperandTypes.front();
+
+    // We only handle polymorphic builtins with trivial types today.
+    if (!firstType.is<BuiltinType>() || !firstType.isTrivial(*fn)) {
       return false;
+    }
 
-    // Ok, at this point we know that we are still qualified. Since functions
-    // start as qualified, we need to set the HasOwnershipQualifiedInstructions
-    // so we do not need to look back through the function if we see an
-    // unqualified instruction later on.
-    HasOwnershipQualifiedInstruction = true;
-    return true;
-  }
-  case OwnershipQualifiedKind::NotApplicable: {
-    // Not Applicable instr
-    return true;
-  }
+    resultType = firstType.getObjectType();
+    oldOperandTypes = oldOperandTypes.drop_front();
+  } else {
+    resultType = oldResultType;
   }
 
-  llvm_unreachable("Unhandled OwnershipQualifiedKind in switch.");
+  // Then go through all of our values and bail if any after substitution are
+  // not concrete builtin types. Otherwise, stash each of them in the argTypes
+  // array as objects. We will convert them as appropriate.
+  for (SILType ty : oldOperandTypes) {
+    // If after specialization, we do not have a trivial builtin type, bail.
+    if (!ty.is<BuiltinType>() || !ty.isTrivial(*fn)) {
+      return false;
+    }
+
+    // Otherwise, we have an object builtin type ready to go.
+    argTypes.push_back(ty.getObjectType());
+  }
+
+  // Ok, we have all builtin types. Infer the underlying polymorphic builtin
+  // name form our first argument.
+  CanBuiltinType builtinType = argTypes.front().getAs<BuiltinType>();
+  SmallString<32> builtinTypeNameStorage;
+  StringRef typeName = builtinType->getTypeName(builtinTypeNameStorage, false);
+  staticOverloadName.append("_");
+  staticOverloadName.append(typeName);
+
+  auto &ctx = fn->getASTContext();
+  staticOverloadIdentifier = ctx.getIdentifier(staticOverloadName);
+
+  // Ok, we have our overload identifier. Grab the builtin info from the
+  // cache. If we did not actually found a valid builtin value kind for our
+  // overload, then we do not have a static overload for the passed in types, so
+  // return false.
+  builtinInfo = &fn->getModule().getBuiltinInfo(staticOverloadIdentifier);
+  return true;
+}
+
+bool PolymorphicBuiltinSpecializedOverloadInfo::init(BuiltinInst *bi) {
+  assert(!isInitialized && "Can not init twice?!");
+  SWIFT_DEFER { isInitialized = true; };
+
+  // First quickly make sure we have a /real/ BuiltinValueKind, not an intrinsic
+  // or None.
+  auto kind = bi->getBuiltinKind();
+  if (!kind)
+    return false;
+
+  SmallVector<SILType, 8> oldOperandTypes;
+  copy(bi->getOperandTypes(), std::back_inserter(oldOperandTypes));
+  assert(bi->getNumResults() == 1 &&
+         "We expect a tuple here instead of real args");
+  SILType oldResultType = bi->getResult(0)->getType();
+  return init(bi->getFunction(), *kind, oldOperandTypes, oldResultType);
+}
+
+SILValue
+swift::getStaticOverloadForSpecializedPolymorphicBuiltin(BuiltinInst *bi) {
+
+  PolymorphicBuiltinSpecializedOverloadInfo info;
+  if (!info.init(bi))
+    return SILValue();
+
+  SmallVector<SILValue, 8> rawArgsData;
+  copy(bi->getOperandValues(), std::back_inserter(rawArgsData));
+
+  SILValue result = bi->getResult(0);
+  MutableArrayRef<SILValue> rawArgs = rawArgsData;
+
+  if (info.hasOutParam) {
+    result = rawArgs.front();
+    rawArgs = rawArgs.drop_front();
+  }
+
+  assert(bi->getNumResults() == 1 &&
+         "We assume that builtins have a single result today. If/when this "
+         "changes, this code needs to be updated");
+
+  SILBuilderWithScope builder(bi);
+
+  // Ok, now we know that we can convert this to our specialized
+  // builtin. Prepare the arguments for the specialized value, loading the
+  // values if needed and storing the result into an out parameter if needed.
+  //
+  // NOTE: We only support polymorphic builtins with trivial types today, so we
+  // use load/store trivial as a result.
+  SmallVector<SILValue, 8> newArgs;
+  for (SILValue arg : rawArgs) {
+    if (arg->getType().isObject()) {
+      newArgs.push_back(arg);
+      continue;
+    }
+
+    SILValue load = builder.emitLoadValueOperation(
+        bi->getLoc(), arg, LoadOwnershipQualifier::Trivial);
+    newArgs.push_back(load);
+  }
+
+  BuiltinInst *newBI =
+      builder.createBuiltin(bi->getLoc(), info.staticOverloadIdentifier,
+                            info.resultType, {}, newArgs);
+
+  // If we have an out parameter initialize it now.
+  if (info.hasOutParam) {
+    builder.emitStoreValueOperation(newBI->getLoc(), newBI->getResult(0),
+                                    result, StoreOwnershipQualifier::Trivial);
+  }
+
+  return newBI;
 }

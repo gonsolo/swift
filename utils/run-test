@@ -21,10 +21,8 @@ from swift_build_support.swift_build_support import (
     arguments,
     shell
 )
-
 from swift_build_support.swift_build_support.SwiftBuildSupport import \
     SWIFT_SOURCE_ROOT
-
 from swift_build_support.swift_build_support.targets import \
     StdlibDeploymentTarget
 
@@ -202,7 +200,8 @@ def main():
         upload_stdlib_targets = []
         need_validation = any('/validation-test-' in path for path in paths)
         for target in targets:
-            upload_stdlib_targets += ["upload-stdlib-%s" % target]
+            if args.mode != 'only_non_executable':
+                upload_stdlib_targets += ["upload-stdlib-%s" % target]
             if need_validation:
                 dependency_targets += ["swift-stdlib-%s" % target]
             else:

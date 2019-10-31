@@ -24,11 +24,14 @@
 #include "swift/AST/ResilienceExpansion.h"
 #include "swift/AST/TypeAlignments.h"
 #include "swift/Basic/LLVM.h"
-#include "swift/Basic/SourceLoc.h"
 #include "swift/Basic/STLExtras.h"
+#include "swift/Basic/SourceLoc.h"
 #include "llvm/ADT/PointerEmbeddedInt.h"
 #include "llvm/ADT/PointerIntPair.h"
 #include "llvm/ADT/PointerUnion.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include <type_traits>
 
 namespace llvm {
   class raw_ostream;
@@ -77,6 +80,7 @@ enum class DeclContextKind : unsigned {
   Initializer,
   TopLevelCodeDecl,
   SubscriptDecl,
+  EnumElementDecl,
   AbstractFunctionDecl,
   SerializedLocal,
   Last_LocalDeclContextKind = SerializedLocal,
@@ -144,6 +148,8 @@ enum class ConformanceLookupKind : unsigned {
   All,
   /// Only the explicit conformance.
   OnlyExplicit,
+  /// All conformances except for inherited ones.
+  NonInherited,
 };
 
 /// Describes a diagnostic for a conflict between two protocol
@@ -213,7 +219,7 @@ class alignas(1 << DeclContextAlignInBits) DeclContext {
 
   /// If this DeclContext is a GenericType declaration or an
   /// extension thereof, return the GenericTypeDecl.
-  GenericTypeDecl *getAsTypeOrTypeExtensionContext() const;
+  GenericTypeDecl *getSelfTypeDecl() const;
 
   static ASTHierarchy getASTHierarchyFromKind(DeclContextKind Kind) {
     switch (Kind) {
@@ -229,6 +235,7 @@ class alignas(1 << DeclContextAlignInBits) DeclContext {
     case DeclContextKind::TopLevelCodeDecl:
     case DeclContextKind::AbstractFunctionDecl:
     case DeclContextKind::SubscriptDecl:
+    case DeclContextKind::EnumElementDecl:
     case DeclContextKind::GenericTypeDecl:
     case DeclContextKind::ExtensionDecl:
       return ASTHierarchy::Decl;
@@ -237,12 +244,13 @@ class alignas(1 << DeclContextAlignInBits) DeclContext {
   }
 
 public:
-  Decl *getAsDeclOrDeclExtensionContext() {
+  LLVM_READONLY
+  Decl *getAsDecl() {
     return ParentAndKind.getInt() == ASTHierarchy::Decl ?
       reinterpret_cast<Decl*>(this + 1) : nullptr;
   }
-  const Decl *getAsDeclOrDeclExtensionContext() const {
-    return const_cast<DeclContext*>(this)->getAsDeclOrDeclExtensionContext();
+  const Decl *getAsDecl() const {
+    return const_cast<DeclContext*>(this)->getAsDecl();
   }
 
   DeclContext(DeclContextKind Kind, DeclContext *Parent)
@@ -253,7 +261,13 @@ public:
 
   /// Returns the kind of context this is.
   DeclContextKind getContextKind() const;
-  
+
+  /// Returns whether this context has value semantics.
+  bool hasValueSemantics() const;
+
+  /// Returns whether this context is an extension constrained to a class type.
+  bool isClassConstrainedProtocolExtension() const;
+
   /// Determines whether this context is itself a local scope in a
   /// code block.  A context that appears in such a scope, like a
   /// local type declaration, does not itself become a local context.
@@ -262,46 +276,52 @@ public:
   }
   
   /// isModuleContext - Return true if this is a subclass of Module.
+  LLVM_READONLY
   bool isModuleContext() const; // see swift/AST/Module.h
 
   /// \returns true if this is a context with module-wide scope, e.g. a module
   /// or a source file.
+  LLVM_READONLY
   bool isModuleScopeContext() const; // see swift/AST/Module.h
 
   /// \returns true if this is a type context, e.g., a struct, a class, an
   /// enum, a protocol, or an extension.
+  LLVM_READONLY
   bool isTypeContext() const;
-
-  /// \brief Determine whether this is an extension context.
-  bool isExtensionContext() const; // see swift/AST/Decl.h
 
   /// If this DeclContext is a NominalType declaration or an
   /// extension thereof, return the NominalTypeDecl.
-  NominalTypeDecl *getAsNominalTypeOrNominalTypeExtensionContext() const;
+  LLVM_READONLY
+  NominalTypeDecl *getSelfNominalTypeDecl() const;
 
   /// If this DeclContext is a class, or an extension on a class, return the
   /// ClassDecl, otherwise return null.
-  ClassDecl *getAsClassOrClassExtensionContext() const;
+  LLVM_READONLY
+  ClassDecl *getSelfClassDecl() const;
 
   /// If this DeclContext is an enum, or an extension on an enum, return the
   /// EnumDecl, otherwise return null.
-  EnumDecl *getAsEnumOrEnumExtensionContext() const;
+  LLVM_READONLY
+  EnumDecl *getSelfEnumDecl() const;
 
   /// If this DeclContext is a struct, or an extension on a struct, return the
   /// StructDecl, otherwise return null.
-  StructDecl *getAsStructOrStructExtensionContext() const;
+  LLVM_READONLY
+  StructDecl *getSelfStructDecl() const;
 
   /// If this DeclContext is a protocol, or an extension on a
   /// protocol, return the ProtocolDecl, otherwise return null.
-  ProtocolDecl *getAsProtocolOrProtocolExtensionContext() const;
+  LLVM_READONLY
+  ProtocolDecl *getSelfProtocolDecl() const;
 
   /// If this DeclContext is a protocol extension, return the extended protocol.
-  ProtocolDecl *getAsProtocolExtensionContext() const;
+  LLVM_READONLY
+  ProtocolDecl *getExtendedProtocolDecl() const;
 
-  /// \brief Retrieve the generic parameter 'Self' from a protocol or
+  /// Retrieve the generic parameter 'Self' from a protocol or
   /// protocol extension.
   ///
-  /// Only valid if \c getAsProtocolOrProtocolExtensionContext().
+  /// Only valid if \c getSelfProtocolDecl().
   GenericTypeParamType *getProtocolSelfType() const;
 
   /// Gets the type being declared by this context.
@@ -328,29 +348,30 @@ public:
   /// - Everything else falls back on getDeclaredInterfaceType().
   Type getSelfInterfaceType() const;
 
-  /// \brief Retrieve the innermost generic parameters of this context or any
-  /// of its parents.
+  /// Visit the generic parameter list of every outer context, innermost first.
+  void forEachGenericContext(
+    llvm::function_ref<void (GenericParamList *)> fn) const;
+
+  /// Returns the depth of this generic context, or in other words,
+  /// the number of nested generic contexts minus one.
   ///
-  /// FIXME: Remove this
-  GenericParamList *getGenericParamsOfContext() const;
+  /// This is (unsigned)-1 if none of the outer contexts are generic.
+  unsigned getGenericContextDepth() const;
 
-  /// \brief Retrieve the innermost generic signature of this context or any
+  /// Retrieve the innermost generic signature of this context or any
   /// of its parents.
-  GenericSignature *getGenericSignatureOfContext() const;
+  GenericSignature getGenericSignatureOfContext() const;
 
-  /// \brief Retrieve the innermost archetypes of this context or any
+  /// Retrieve the innermost archetypes of this context or any
   /// of its parents.
   GenericEnvironment *getGenericEnvironmentOfContext() const;
-
-  /// Whether the context has a generic environment that will be constructed
-  /// on first access (but has not yet been constructed).
-  bool contextHasLazyGenericEnvironment() const;
 
   /// Map an interface type to a contextual type within this context.
   Type mapTypeIntoContext(Type type) const;
 
   /// Returns this or the first local parent context, or nullptr if it is not
   /// contained in one.
+  LLVM_READONLY
   DeclContext *getLocalContext();
   const DeclContext *getLocalContext() const {
     return const_cast<DeclContext*>(this)->getLocalContext();
@@ -363,6 +384,7 @@ public:
   /// destructors).
   ///
   /// \returns the innermost method, or null if there is no such method.
+  LLVM_READONLY
   AbstractFunctionDecl *getInnermostMethodContext();
   const AbstractFunctionDecl *getInnermostMethodContext() const {
     return const_cast<DeclContext*>(this)->getInnermostMethodContext();
@@ -373,6 +395,7 @@ public:
   /// This routine looks through closure, initializer, and local function
   /// contexts to find the innermost type context -- nominal type or
   /// extension.
+  LLVM_READONLY
   DeclContext *getInnermostTypeContext();
   const DeclContext *getInnermostTypeContext() const {
     return const_cast<DeclContext *>(this)->getInnermostTypeContext();
@@ -382,10 +405,20 @@ public:
   ///
   /// This routine looks through contexts to find the innermost
   /// declaration context that is itself a declaration.
+  LLVM_READONLY
   Decl *getInnermostDeclarationDeclContext();
   const Decl *getInnermostDeclarationDeclContext() const {
     return
         const_cast<DeclContext *>(this)->getInnermostDeclarationDeclContext();
+  }
+
+  /// Returns the innermost context that is an AbstractFunctionDecl whose
+  /// body has been skipped.
+  LLVM_READONLY
+  DeclContext *getInnermostSkippedFunctionContext();
+  const DeclContext *getInnermostSkippedFunctionContext() const {
+    return
+        const_cast<DeclContext *>(this)->getInnermostSkippedFunctionContext();
   }
 
   /// Returns the semantic parent of this context.  A context has a
@@ -408,20 +441,19 @@ public:
     return false;
   }
 
-  /// Compute a context C such that C is a parent context of A and B.
-  /// If no such context exists, return \c nullptr.
-  static DeclContext *getCommonParentContext(DeclContext *A, DeclContext *B);
-
   /// Returns the module context that contains this context.
+  LLVM_READONLY
   ModuleDecl *getParentModule() const;
 
   /// Returns the module scope context that contains this context.
   ///
   /// This is either a \c Module or a \c FileUnit.
+  LLVM_READONLY
   DeclContext *getModuleScopeContext() const;
 
   /// Returns the source file that contains this context, or null if this
   /// is not within a source file.
+  LLVM_READONLY
   SourceFile *getParentSourceFile() const;
 
   /// Determine whether this declaration context is generic, meaning that it or
@@ -436,6 +468,14 @@ public:
   /// domains, this ensures that only sufficiently-conservative access patterns
   /// are used.
   ResilienceExpansion getResilienceExpansion() const;
+
+  /// Returns true if this context may possibly contain members visible to
+  /// AnyObject dynamic lookup.
+  bool mayContainMembersAccessedByDynamicLookup() const;
+
+  /// Extensions are only allowed at the level in a file
+  /// FIXME: do this for Protocols, too someday
+  bool canBeParentOfExtension() const;
 
   /// Returns true if lookups within this context could affect downstream files.
   ///
@@ -461,15 +501,37 @@ public:
   /// \param options Options that control name lookup, based on the
   /// \c NL_* constants in \c NameLookupOptions.
   ///
-  /// \param typeResolver Used to resolve types, usually for overload purposes.
-  /// May be null.
-  ///
   /// \param[out] decls Will be populated with the declarations found by name
   /// lookup.
   ///
   /// \returns true if anything was found.
   bool lookupQualified(Type type, DeclName member, NLOptions options,
-                       LazyResolver *typeResolver,
+                       SmallVectorImpl<ValueDecl *> &decls) const;
+
+  /// Look for the set of declarations with the given name within the
+  /// given set of nominal type declarations.
+  ///
+  /// \param types The type declarations to look into.
+  ///
+  /// \param member The member to search for.
+  ///
+  /// \param options Options that control name lookup, based on the
+  /// \c NL_* constants in \c NameLookupOptions.
+  ///
+  /// \param[out] decls Will be populated with the declarations found by name
+  /// lookup.
+  ///
+  /// \returns true if anything was found.
+  bool lookupQualified(ArrayRef<NominalTypeDecl *> types, DeclName member,
+                       NLOptions options,
+                       SmallVectorImpl<ValueDecl *> &decls) const;
+
+  /// Perform qualified lookup for the given member in the given module.
+  bool lookupQualified(ModuleDecl *module, DeclName member, NLOptions options,
+                       SmallVectorImpl<ValueDecl *> &decls) const;
+
+  /// Perform \c AnyObject lookup for the given member.
+  bool lookupAnyObject(DeclName member, NLOptions options,
                        SmallVectorImpl<ValueDecl *> &decls) const;
 
   /// Look up all Objective-C methods with the given selector visible
@@ -480,6 +542,7 @@ public:
 
   /// Return the ASTContext for a specified DeclContext by
   /// walking up to the enclosing module and returning its ASTContext.
+  LLVM_READONLY
   ASTContext &getASTContext() const;
 
   /// Retrieve the set of protocols whose conformances will be
@@ -494,17 +557,13 @@ public:
   ///
   /// \param diagnostics If non-null, will be populated with the set of
   /// diagnostics that should be emitted for this declaration context.
-  ///
-  /// \param sorted Whether to sort the results in a canonical order.
-  ///
   /// FIXME: This likely makes more sense on IterableDeclContext or
   /// something similar.
   SmallVector<ProtocolDecl *, 2>
   getLocalProtocols(ConformanceLookupKind lookupKind
                       = ConformanceLookupKind::All,
                     SmallVectorImpl<ConformanceDiagnostic> *diagnostics
-                      = nullptr,
-                    bool sorted = false) const;
+                      = nullptr) const;
 
   /// Retrieve the set of protocol conformances associated with this
   /// declaration context.
@@ -514,16 +573,13 @@ public:
   /// \param diagnostics If non-null, will be populated with the set of
   /// diagnostics that should be emitted for this declaration context.
   ///
-  /// \param sorted Whether to sort the results in a canonical order.
-  ///
   /// FIXME: This likely makes more sense on IterableDeclContext or
   /// something similar.
   SmallVector<ProtocolConformance *, 2>
   getLocalConformances(ConformanceLookupKind lookupKind
                          = ConformanceLookupKind::All,
                        SmallVectorImpl<ConformanceDiagnostic> *diagnostics
-                         = nullptr,
-                       bool sorted = false) const;
+                         = nullptr) const;
 
   /// Retrieve the syntactic depth of this declaration context, i.e.,
   /// the number of non-module-scoped contexts.
@@ -542,7 +598,8 @@ public:
   bool walkContext(ASTWalker &Walker);
 
   void dumpContext() const;
-  unsigned printContext(llvm::raw_ostream &OS, unsigned indent = 0) const;
+  unsigned printContext(llvm::raw_ostream &OS, unsigned indent = 0,
+                        bool onlyAPartialLine = false) const;
 
   // Only allow allocation of DeclContext using the allocator in ASTContext.
   void *operator new(size_t Bytes, ASTContext &C,
@@ -613,7 +670,7 @@ public:
 
 /// The range of declarations stored within an iterable declaration
 /// context.
-typedef IteratorRange<DeclIterator> DeclRange;
+using DeclRange = iterator_range<DeclIterator>;
 
 /// The kind of an \c IterableDeclContext.
 enum class IterableDeclContextKind : uint8_t {  
@@ -649,6 +706,24 @@ class IterableDeclContext {
   /// member loading, as a key when doing lookup in this IDC.
   serialization::DeclID SerialID;
 
+  /// Because \c parseDelayedDecl and lazy member adding can add members *after*
+  /// an \c ASTScope tree is created, there must be some way for the tree to
+  /// detect when a member has been added. A bit would suffice,
+  /// but would be more fragile, The scope code could count the members each
+  /// time, but I think it's a better trade to just keep a count here.
+  unsigned MemberCount : 29;
+
+  /// Whether we have already added the parsed members into the context.
+  unsigned AddedParsedMembers : 1;
+
+  /// Whether delayed parsing detected a possible operator definition
+  /// while skipping the body of this context.
+  unsigned HasOperatorDeclarations : 1;
+
+  /// Whether delayed parsing detect a possible nested class definition
+  /// while skipping the body of this context.
+  unsigned HasNestedClassDeclarations : 1;
+
   template<class A, class B, class C>
   friend struct ::llvm::cast_convert_val;
 
@@ -659,11 +734,36 @@ class IterableDeclContext {
 
 public:
   IterableDeclContext(IterableDeclContextKind kind)
-    : LastDeclAndKind(nullptr, kind) { }
+    : LastDeclAndKind(nullptr, kind) {
+    MemberCount = 0;
+    AddedParsedMembers = 0;
+    HasOperatorDeclarations = 0;
+    HasNestedClassDeclarations = 0;
+  }
 
   /// Determine the kind of iterable context we have.
   IterableDeclContextKind getIterableContextKind() const {
     return LastDeclAndKind.getInt();
+  }
+
+  bool hasUnparsedMembers() const;
+
+  bool maybeHasOperatorDeclarations() const {
+    return HasOperatorDeclarations;
+  }
+
+  void setMaybeHasOperatorDeclarations() {
+    assert(hasUnparsedMembers());
+    HasOperatorDeclarations = 1;
+  }
+
+  bool maybeHasNestedClassDeclarations() const {
+    return HasNestedClassDeclarations;
+  }
+
+  void setMaybeHasNestedClassDeclarations() {
+    assert(hasUnparsedMembers());
+    HasNestedClassDeclarations = 1;
   }
 
   /// Retrieve the set of members in this context.
@@ -677,6 +777,9 @@ public:
   /// Add a member to this context. If the hint decl is specified, the new decl
   /// is inserted immediately after the hint.
   void addMember(Decl *member, Decl *hint = nullptr);
+
+  /// See \c MemberCount
+  unsigned getMemberCount() const;
 
   /// Check whether there are lazily-loaded members.
   bool hasLazyMembers() const {
@@ -732,7 +835,26 @@ private:
   /// member is an invisible addition.
   void addMemberSilently(Decl *member, Decl *hint = nullptr) const;
 };
-  
+
+/// Define simple_display for DeclContexts but not for subclasses in order to
+/// avoid ambiguities with Decl* arguments.
+template <typename ParamT, typename = typename std::enable_if<
+                               std::is_same<ParamT, DeclContext>::value>::type>
+void simple_display(llvm::raw_ostream &out, const ParamT *dc) {
+  if (dc)
+    dc->printContext(out, 0, true);
+  else
+    out << "(null)";
+}
+
+void simple_display(llvm::raw_ostream &out, const IterableDeclContext *idc);
+
+/// Extract the source location from the given declaration context.
+SourceLoc extractNearestSourceLoc(const DeclContext *dc);
+
+/// Extract the source location from the given declaration context.
+SourceLoc extractNearestSourceLoc(const IterableDeclContext *idc);
+
 } // end namespace swift
 
 namespace llvm {

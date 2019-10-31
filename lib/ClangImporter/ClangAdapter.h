@@ -19,7 +19,6 @@
 #define CLANG_ADAPTER_H
 
 #include "swift/Basic/StringExtras.h"
-#include "swift/Serialization/ModuleFormat.h"
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "clang/Basic/Specifiers.h"
@@ -47,6 +46,8 @@ class TypedefNameDecl;
 // TODO: pull more off of the ImportImpl
 
 namespace swift {
+enum OptionalTypeKind : unsigned;
+
 namespace importer {
 struct PlatformAvailability;
 
@@ -83,7 +84,7 @@ clang::SwiftNewtypeAttr *getSwiftNewtypeAttr(const clang::TypedefNameDecl *decl,
 
 /// Retrieve a bit vector containing the non-null argument
 /// annotations for the given declaration.
-llvm::SmallBitVector
+SmallBitVector
 getNonNullArgs(const clang::Decl *decl,
                ArrayRef<const clang::ParmVarDecl *> params);
 
@@ -109,15 +110,6 @@ bool hasNativeSwiftDecl(const clang::Decl *decl);
 
 /// Translation API nullability from an API note into an optional kind.
 OptionalTypeKind translateNullability(clang::NullabilityKind kind);
-
-/// Determine whether the given class has designated initializers,
-/// consulting
-bool hasDesignatedInitializers(const clang::ObjCInterfaceDecl *classDecl);
-
-/// Determine whether the given method is a designated initializer
-/// of the given class.
-bool isDesignatedInitializer(const clang::ObjCInterfaceDecl *classDecl,
-                             const clang::ObjCMethodDecl *method);
 
 /// Determine whether the given method is a required initializer
 /// of the given class.

@@ -203,6 +203,7 @@ Optional<Type> TypeChecker::checkObjCKeyPathExpr(DeclContext *dc,
     // TODO: Perhaps we can map subscript components to dictionary keys.
     switch (auto kind = component.getKind()) {
     case KeyPathExpr::Component::Kind::Invalid:
+    case KeyPathExpr::Component::Kind::Identity:
       continue;
 
     case KeyPathExpr::Component::Kind::UnresolvedProperty:
@@ -210,6 +211,7 @@ Optional<Type> TypeChecker::checkObjCKeyPathExpr(DeclContext *dc,
     case KeyPathExpr::Component::Kind::UnresolvedSubscript:
     case KeyPathExpr::Component::Kind::OptionalChain:
     case KeyPathExpr::Component::Kind::OptionalForce:
+    case KeyPathExpr::Component::Kind::TupleElement:
       diagnose(componentNameLoc,
                diag::expr_unsupported_objc_key_path_component,
                (unsigned)kind);
@@ -316,15 +318,12 @@ Optional<Type> TypeChecker::checkObjCKeyPathExpr(DeclContext *dc,
 
     // Handle property references.
     if (auto var = dyn_cast<VarDecl>(found)) {
-      validateDecl(var);
-
       // Resolve this component to the variable we found.
       auto varRef = ConcreteDeclRef(var);
       auto resolved =
         KeyPathExpr::Component::forProperty(varRef, Type(), componentNameLoc);
       resolvedComponents.push_back(resolved);
-      updateState(/*isProperty=*/true,
-                  var->getInterfaceType()->getRValueObjectType());
+      updateState(/*isProperty=*/true, var->getInterfaceType());
 
       // Check that the property is @objc.
       if (!var->isObjC()) {
@@ -344,9 +343,7 @@ Optional<Type> TypeChecker::checkObjCKeyPathExpr(DeclContext *dc,
               Swift3ObjCInferenceWarnings::Minimal) {
           diagnose(componentNameLoc, diag::expr_keypath_swift3_objc_inference,
                    var->getFullName(),
-                   var->getDeclContext()
-                    ->getAsNominalTypeOrNominalTypeExtensionContext()
-                   ->getName());
+                   var->getDeclContext()->getSelfNominalTypeDecl()->getName());
           diagnose(var, diag::make_decl_objc, var->getDescriptiveKind())
             .fixItInsert(var->getAttributeInsertionLoc(false),
                          "@objc ");
@@ -396,7 +393,8 @@ Optional<Type> TypeChecker::checkObjCKeyPathExpr(DeclContext *dc,
 
     // Declarations that cannot be part of a key-path.
     diagnose(componentNameLoc, diag::expr_keypath_not_property,
-             found->getDescriptiveKind(), found->getFullName());
+             found->getDescriptiveKind(), found->getFullName(),
+             /*isForDynamicKeyPathMemberLookup=*/false);
     isInvalid = true;
     break;
   }

@@ -14,6 +14,7 @@
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
+#include "swift/Basic/Version.h"
 
 namespace llvm {
 class raw_ostream;
@@ -23,13 +24,37 @@ namespace swift {
 class FileUnit;
 class ModuleDecl;
 
-void enumeratePublicSymbols(FileUnit *module, llvm::StringSet<> &symbols,
-                            bool hasMultipleIGMs);
-void enumeratePublicSymbols(ModuleDecl *module, llvm::StringSet<> &symbols,
-                            bool hasMultipleIGMs);
+/// Options for controlling the exact set of symbols included in the TBD
+/// output.
+struct TBDGenOptions {
+  /// Whether this compilation has multiple IRGen instances.
+  bool HasMultipleIGMs;
 
-void writeTBDFile(ModuleDecl *M, llvm::raw_ostream &os, bool hasMultipleIGMs,
-                  llvm::StringRef installName);
+  /// Whether this compilation is producing a TBD for InstallAPI.
+  bool IsInstallAPI;
+
+  /// The install_name to use in the TBD file.
+  std::string InstallName;
+
+  /// The module link name (for force loading).
+  std::string ModuleLinkName;
+
+  /// The current project version to use in the generated TBD file. Defaults
+  /// to None.
+  llvm::Optional<version::Version> CurrentVersion = None;
+
+  /// The dylib compatibility-version to use in the generated TBD file. Defaults
+  /// to None.
+  llvm::Optional<version::Version> CompatibilityVersion = None;
+};
+
+void enumeratePublicSymbols(FileUnit *module, llvm::StringSet<> &symbols,
+                            const TBDGenOptions &opts);
+void enumeratePublicSymbols(ModuleDecl *module, llvm::StringSet<> &symbols,
+                            const TBDGenOptions &opts);
+
+void writeTBDFile(ModuleDecl *M, llvm::raw_ostream &os,
+                  const TBDGenOptions &opts);
 
 } // end namespace swift
 

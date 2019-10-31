@@ -13,6 +13,7 @@ add_swift_unittest(SwiftBasicTests
   DiverseStackTest.cpp
   EditorPlaceholderTest.cpp
   EncodedSequenceTest.cpp
+  ExponentialGrowthAppendingBinaryByteStreamTests.cpp
   FileSystemTest.cpp
   ImmutablePointerSetTest.cpp
   JSONSerialization.cpp
@@ -22,10 +23,11 @@ add_swift_unittest(SwiftBasicTests
   PrefixMapTest.cpp
   RangeTest.cpp
   SourceManagerTest.cpp
+  STLExtrasTest.cpp
   StringExtrasTest.cpp
   SuccessorMapTest.cpp
   ThreadSafeRefCntPointerTest.cpp
-  TransformArrayRefTest.cpp
+  TransformRangeTest.cpp
   TreeScopedHashTableTest.cpp
   UnicodeTest.cpp
   ValueEnumeratorTest.cpp
@@ -38,4 +40,5 @@ target_link_libraries(SwiftBasicTests
   PRIVATE
   swiftBasic
   clangBasic
+  LLVMTestingSupport
   )

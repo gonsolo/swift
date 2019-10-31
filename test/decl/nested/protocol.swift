@@ -51,27 +51,64 @@ protocol Racoon {
   }
 }
 
-enum SillyRawEnum : SillyProtocol.InnerClass {}
-// expected-error@-1 {{type 'SillyRawEnum' does not conform to protocol 'RawRepresentable'}}
+enum SillyRawEnum : SillyProtocol.InnerClass {} // expected-error {{an enum with no cases cannot declare a raw type}}
+// expected-error@-1 {{raw type}}
 
 protocol SillyProtocol {
   class InnerClass<T> {} // expected-error {{type 'InnerClass' cannot be nested in protocol 'SillyProtocol'}}
 }
 
+// N.B. Redeclaration checks don't see this case because `protocol A` is invalid.
 enum OuterEnum {
   protocol C {} // expected-error{{protocol 'C' cannot be nested inside another declaration}}
-  // expected-note@-1{{'C' previously declared here}}
-  case C(C) // expected-error{{invalid redeclaration of 'C'}}
+  case C(C)
 }
 
 class OuterClass {
   protocol InnerProtocol : OuterClass { }
-  // expected-error@-1{{non-class type 'InnerProtocol' cannot inherit from class 'OuterClass'}}
-  // expected-error@-2{{protocol 'InnerProtocol' cannot be nested inside another declaration}}
+  // expected-error@-1{{protocol 'InnerProtocol' cannot be nested inside another declaration}}
 }
 
 class OtherGenericClass<T> {
   protocol InnerProtocol : OtherGenericClass { }
-  // expected-error@-1{{non-class type 'InnerProtocol' cannot inherit from class 'OtherGenericClass<T>'}}
-  // expected-error@-2{{protocol 'InnerProtocol' cannot be nested inside another declaration}}
+  // expected-error@-1{{protocol 'InnerProtocol' cannot be nested inside another declaration}}
+  // expected-error@-2{{superclass constraint 'Self' : 'OtherGenericClass<Self>' is recursive}}
+}
+
+protocol SelfDotTest {
+  func f(_: Self.Class)
+  class Class {}
+  // expected-error@-1{{type 'Class' cannot be nested in protocol 'SelfDotTest'}}
+}
+
+struct Outer {
+  typealias E = NestedValidation.T
+  protocol NestedValidation { // expected-error {{protocol 'NestedValidation' cannot be nested inside another declaration}}
+    typealias T = A.B
+    class A { // expected-error {{type 'A' cannot be nested in protocol 'NestedValidation'}}
+      typealias B = Int
+    }
+  }
+}
+
+struct OuterForUFI {
+  @usableFromInline
+  protocol Inner { // expected-error {{protocol 'Inner' cannot be nested inside another declaration}}
+    func req()
+  }
+}
+
+extension OuterForUFI.Inner {
+  public func extMethod() {} // The 'public' puts this in a special path.
+}
+
+func testLookup(_ x: OuterForUFI.Inner) {
+  x.req()
+  x.extMethod()
+}
+
+// N.B. Lookup fails here because OuterForUFI.Inner is marked invalid.
+func testLookup<T: OuterForUFI.Inner>(_ x: T) {
+  x.req() // expected-error {{value of type 'T' has no member 'req'}}
+  x.extMethod() // expected-error {{value of type 'T' has no member 'extMethod'}}
 }

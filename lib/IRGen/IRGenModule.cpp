@@ -14,6 +14,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/AST/Availability.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/DiagnosticsIRGen.h"
@@ -21,6 +22,7 @@
 #include "swift/Basic/Dwarf.h"
 #include "swift/Demangling/ManglingMacros.h"
 #include "swift/ClangImporter/ClangImporter.h"
+#include "swift/IRGen/IRGenPublic.h"
 #include "swift/IRGen/Linking.h"
 #include "swift/Runtime/RuntimeFnWrappersGen.h"
 #include "swift/Runtime/Config.h"
@@ -34,7 +36,7 @@
 #include "clang/Lex/PreprocessorOptions.h"
 #include "clang/Lex/HeaderSearch.h"
 #include "clang/Lex/HeaderSearchOptions.h"
-#include "clang/Frontend/CodeGenOptions.h"
+#include "clang/Basic/CodeGenOptions.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
@@ -47,10 +49,13 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MD5.h"
 
+#include "ConformanceDescription.h"
 #include "GenEnum.h"
+#include "GenIntegerLiteral.h"
 #include "GenType.h"
 #include "IRGenModule.h"
 #include "IRGenDebugInfo.h"
+#include "ProtocolInfo.h"
 #include "StructLayout.h"
 
 #include <initializer_list>
@@ -90,25 +95,37 @@ static clang::CodeGenerator *createClangCodeGenerator(ASTContext &Context,
 
   auto &CGO = Importer->getClangCodeGenOpts();
   CGO.OptimizationLevel = Opts.shouldOptimize() ? 3 : 0;
-  CGO.DisableFPElim = Opts.DisableFPElim;
+  CGO.setFramePointer(Opts.DisableFPElim
+                          ? clang::CodeGenOptions::FramePointerKind::All
+                          : clang::CodeGenOptions::FramePointerKind::None);
   CGO.DiscardValueNames = !Opts.shouldProvideValueNames();
-  switch (Opts.DebugInfoKind) {
-  case IRGenDebugInfoKind::None:
+  switch (Opts.DebugInfoLevel) {
+  case IRGenDebugInfoLevel::None:
     CGO.setDebugInfo(clang::codegenoptions::DebugInfoKind::NoDebugInfo);
     break;
-  case IRGenDebugInfoKind::LineTables:
+  case IRGenDebugInfoLevel::LineTables:
     CGO.setDebugInfo(clang::codegenoptions::DebugInfoKind::DebugLineTablesOnly);
     break;
-  case IRGenDebugInfoKind::ASTTypes:
-  case IRGenDebugInfoKind::DwarfTypes:
+  case IRGenDebugInfoLevel::ASTTypes:
+  case IRGenDebugInfoLevel::DwarfTypes:
     CGO.DebugTypeExtRefs = true;
     CGO.setDebugInfo(clang::codegenoptions::DebugInfoKind::FullDebugInfo);
     break;
   }
-  if (Opts.DebugInfoKind > IRGenDebugInfoKind::None) {
+  switch (Opts.DebugInfoFormat) {
+  case IRGenDebugInfoFormat::None:
+    break;
+  case IRGenDebugInfoFormat::DWARF:
     CGO.DebugCompilationDir = Opts.DebugCompilationDir;
     CGO.DwarfVersion = Opts.DWARFVersion;
-    CGO.DwarfDebugFlags = Opts.DWARFDebugFlags;
+    CGO.DwarfDebugFlags = Opts.DebugFlags;
+    break;
+  case IRGenDebugInfoFormat::CodeView:
+    CGO.EmitCodeView = true;
+    CGO.DebugCompilationDir = Opts.DebugCompilationDir;
+    // This actually contains the debug flags for codeview.
+    CGO.DwarfDebugFlags = Opts.DebugFlags;
+    break;
   }
 
   auto &HSI = Importer->getClangPreprocessor()
@@ -131,7 +148,7 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
       ClangCodeGen(createClangCodeGenerator(Context, LLVMContext, irgen.Opts,
                                             ModuleName)),
       Module(*ClangCodeGen->GetModule()), LLVMContext(Module.getContext()),
-      DataLayout(target->createDataLayout()),
+      DataLayout(irgen.getClangDataLayout()),
       Triple(irgen.getEffectiveClangTriple()), TargetMachine(std::move(target)),
       silConv(irgen.SIL), OutputFilename(OutputFilename),
       MainInputFilenameForDebugInfo(MainInputFilenameForDebugInfo),
@@ -156,6 +173,21 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
   Int8PtrPtrTy = Int8PtrTy->getPointerTo(0);
   SizeTy = DataLayout.getIntPtrType(getLLVMContext(), /*addrspace*/ 0);
 
+  // For the relative address type, we want to use the int32 bit type
+  // on most architectures, e.g. x86_64, because it produces valid
+  // fixups/relocations. The exception is 16-bit architectures,
+  // so we shorten the relative address type there.
+  if (SizeTy->getBitWidth()<32) {
+    RelativeAddressTy = SizeTy;
+  } else {
+    RelativeAddressTy = Int32Ty;
+  }
+
+  RelativeAddressPtrTy = RelativeAddressTy->getPointerTo();
+
+  FloatTy = llvm::Type::getFloatTy(getLLVMContext());
+  DoubleTy = llvm::Type::getDoubleTy(getLLVMContext());
+
   auto CI = static_cast<ClangImporter*>(&*Context.getClangModuleLoader());
   assert(CI && "no clang module loader");
   auto &clangASTContext = CI->getClangASTContext();
@@ -169,13 +201,11 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
   RefCountedPtrTy = RefCountedStructTy->getPointerTo(/*addrspace*/ 0);
   RefCountedNull = llvm::ConstantPointerNull::get(RefCountedPtrTy);
 
-  // For now, native weak references are just a pointer.
-  WeakReferencePtrTy =
-    createStructPointerType(*this, "swift.weak", { RefCountedPtrTy });
-
-  // Native unowned references are just a pointer.
-  UnownedReferencePtrTy =
-    createStructPointerType(*this, "swift.unowned", { RefCountedPtrTy });
+  // For now, references storage types are just pointers.
+#define CHECKED_REF_STORAGE(Name, name, ...) \
+  Name##ReferencePtrTy = \
+    createStructPointerType(*this, "swift." #name, { RefCountedPtrTy });
+#include "swift/AST/ReferenceStorage.def"
 
   // A type metadata record is the structure pointed to by the canonical
   // address point of a type metadata.  This is at least one word, and
@@ -189,6 +219,23 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
   TypeMetadataResponseTy = createStructType(*this, "swift.metadata_response", {
     TypeMetadataPtrTy,
     SizeTy
+  });
+
+  OffsetPairTy = llvm::StructType::get(getLLVMContext(), { SizeTy, SizeTy });
+
+  // The TypeLayout structure, including all possible trailing components.
+  FullTypeLayoutTy = createStructType(*this, "swift.full_type_layout", {
+    SizeTy, // size
+    SizeTy, // flags
+    SizeTy, // alignment
+    SizeTy  // extra inhabitant flags (optional)
+  });
+
+  TypeLayoutTy = createStructType(*this, "swift.type_layout", {
+    SizeTy, // size
+    SizeTy, // stride
+    Int32Ty, // flags
+    Int32Ty // extra inhabitant count
   });
 
   // A protocol descriptor describes a protocol. It is not type metadata in
@@ -216,14 +263,13 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
   ProtocolRequirementStructTy =
       createStructType(*this, "swift.protocol_requirement", {
     Int32Ty,                // flags
-    Int32Ty,                // thunk
-    Int32Ty                 // default implementation
+    RelativeAddressTy,      // default implementation
   });
   
   // A tuple type metadata record has a couple extra fields.
   auto tupleElementTy = createStructType(*this, "swift.tuple_element_type", {
     TypeMetadataPtrTy,      // Metadata *Type;
-    SizeTy                  // size_t Offset;
+    Int32Ty                 // int32_t Offset;
   });
   TupleTypeMetadataPtrTy = createStructPointerType(*this, "swift.tuple_type", {
     TypeMetadataStructTy,   // (base)
@@ -331,8 +377,15 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
 
   MethodDescriptorStructTy
     = createStructType(*this, "swift.method_descriptor", {
+      Int32Ty,
       RelativeAddressTy,
-      Int32Ty
+    });
+
+  MethodOverrideDescriptorStructTy
+    = createStructType(*this, "swift.method_override_descriptor", {
+      RelativeAddressTy,
+      RelativeAddressTy,
+      RelativeAddressTy
     });
 
   TypeMetadataRecordTy
@@ -387,7 +440,24 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
                     // point too.
   };
   ObjCBlockStructTy->setBody(objcBlockElts);
-  
+
+  // Class _Nullable callback(Class _Nonnull cls, void * _Nullable arg);
+  llvm::Type *params[] = { ObjCClassPtrTy, Int8PtrTy };
+  ObjCUpdateCallbackTy = llvm::FunctionType::get(ObjCClassPtrTy, params, false);
+
+  // The full class stub structure, including a word before the address point.
+  ObjCFullResilientClassStubTy = createStructType(*this, "objc_full_class_stub", {
+    SizeTy, // zero padding to appease the linker
+    SizeTy, // isa pointer -- always 1
+    ObjCUpdateCallbackTy->getPointerTo() // the update callback
+  });
+
+  // What we actually export.
+  ObjCResilientClassStubTy = createStructType(*this, "objc_class_stub", {
+    SizeTy, // isa pointer -- always 1
+    ObjCUpdateCallbackTy->getPointerTo() // the update callback
+  });
+
   auto ErrorStructTy = llvm::StructType::create(LLVMContext, "swift.error");
   // ErrorStruct is currently opaque to the compiler.
   ErrorPtrTy = ErrorStructTy->getPointerTo(DefaultAS);
@@ -403,6 +473,10 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
   OpenedErrorTriplePtrTy = OpenedErrorTripleTy->getPointerTo(DefaultAS);
 
   WitnessTablePtrPtrTy = WitnessTablePtrTy->getPointerTo(DefaultAS);
+  
+  // todo
+  OpaqueTypeDescriptorTy = TypeContextDescriptorTy;
+  OpaqueTypeDescriptorPtrTy = OpaqueTypeDescriptorTy->getPointerTo();
 
   InvariantMetadataID = LLVMContext.getMDKindID("invariant.load");
   InvariantNode = llvm::MDNode::get(LLVMContext, {});
@@ -413,7 +487,7 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
   DefaultCC = SWIFT_DEFAULT_LLVM_CC;
   SwiftCC = llvm::CallingConv::Swift;
 
-  if (IRGen.Opts.DebugInfoKind > IRGenDebugInfoKind::None)
+  if (opts.DebugInfoLevel > IRGenDebugInfoLevel::None)
     DebugInfo = IRGenDebugInfo::createIRGenDebugInfo(IRGen.Opts, *CI, *this,
                                                      Module,
                                                  MainInputFilenameForDebugInfo);
@@ -429,13 +503,29 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
   IsSwiftErrorInRegister =
     clang::CodeGen::swiftcall::isSwiftErrorLoweredInRegister(
       ClangCodeGen->CGM());
+
+  DynamicReplacementsTy =
+      llvm::StructType::get(getLLVMContext(), {Int8PtrPtrTy, Int8PtrTy});
+  DynamicReplacementsPtrTy = DynamicReplacementsTy->getPointerTo(DefaultAS);
+
+  DynamicReplacementLinkEntryTy =
+      llvm::StructType::create(getLLVMContext(), "swift.dyn_repl_link_entry");
+  DynamicReplacementLinkEntryPtrTy =
+      DynamicReplacementLinkEntryTy->getPointerTo(DefaultAS);
+  llvm::Type *linkEntryFields[] = {
+    Int8PtrTy, // function pointer.
+    DynamicReplacementLinkEntryPtrTy // next.
+  };
+  DynamicReplacementLinkEntryTy->setBody(linkEntryFields);
+
+  DynamicReplacementKeyTy = createStructType(*this, "swift.dyn_repl_key",
+                                             {RelativeAddressTy, Int32Ty});
 }
 
 IRGenModule::~IRGenModule() {
   destroyClangTypeConverter();
   destroyMetadataLayoutMap();
   delete &Types;
-  delete DebugInfo;
 }
 
 static bool isReturnAttribute(llvm::Attribute::AttrKind Attr);
@@ -448,10 +538,39 @@ static bool isReturnAttribute(llvm::Attribute::AttrKind Attr);
 namespace RuntimeConstants {
   const auto ReadNone = llvm::Attribute::ReadNone;
   const auto ReadOnly = llvm::Attribute::ReadOnly;
+  const auto ArgMemOnly = llvm::Attribute::ArgMemOnly;
   const auto NoReturn = llvm::Attribute::NoReturn;
   const auto NoUnwind = llvm::Attribute::NoUnwind;
   const auto ZExt = llvm::Attribute::ZExt;
   const auto FirstParamReturned = llvm::Attribute::Returned;
+
+  RuntimeAvailability AlwaysAvailable(ASTContext &Context) {
+    return RuntimeAvailability::AlwaysAvailable;
+  }
+
+  bool
+  isDeploymentAvailabilityContainedIn(ASTContext &Context,
+                                      AvailabilityContext featureAvailability) {
+    auto deploymentAvailability =
+      AvailabilityContext::forDeploymentTarget(Context);
+    return deploymentAvailability.isContainedIn(featureAvailability);
+  }
+
+  RuntimeAvailability OpaqueTypeAvailability(ASTContext &Context) {
+    auto featureAvailability = Context.getOpaqueTypeAvailability();
+    if (!isDeploymentAvailabilityContainedIn(Context, featureAvailability)) {
+      return RuntimeAvailability::ConditionallyAvailable;
+    }
+    return RuntimeAvailability::AlwaysAvailable;
+  }
+
+  RuntimeAvailability DynamicReplacementAvailability(ASTContext &Context) {
+    auto featureAvailability = Context.getSwift51Availability();
+    if (!isDeploymentAvailabilityContainedIn(Context, featureAvailability)) {
+      return RuntimeAvailability::AvailableByCompatibilityLibrary;
+    }
+    return RuntimeAvailability::AlwaysAvailable;
+  }
 } // namespace RuntimeConstants
 
 // We don't use enough attributes to justify generalizing the
@@ -466,16 +585,60 @@ static bool isReturnedAttribute(llvm::Attribute::AttrKind Attr) {
   return Attr == llvm::Attribute::Returned;
 }
 
+namespace {
+bool isStandardLibrary(const llvm::Module &M) {
+  if (auto *Flags = M.getNamedMetadata("swift.module.flags")) {
+    for (const auto *F : Flags->operands()) {
+      const auto *Key = dyn_cast_or_null<llvm::MDString>(F->getOperand(0));
+      if (!Key)
+        continue;
+
+      const auto *Value =
+          dyn_cast_or_null<llvm::ConstantAsMetadata>(F->getOperand(1));
+      if (!Value)
+        continue;
+
+      if (Key->getString() == "standard-library")
+        return cast<llvm::ConstantInt>(Value->getValue())->isOne();
+    }
+  }
+  return false;
+}
+}
+
+bool IRGenModule::isStandardLibrary() const {
+  return ::isStandardLibrary(Module);
+}
+
 llvm::Constant *swift::getRuntimeFn(llvm::Module &Module,
                       llvm::Constant *&cache,
                       const char *name,
                       llvm::CallingConv::ID cc,
+                      RuntimeAvailability availability,
                       llvm::ArrayRef<llvm::Type*> retTypes,
                       llvm::ArrayRef<llvm::Type*> argTypes,
                       ArrayRef<Attribute::AttrKind> attrs) {
+
   if (cache)
     return cache;
-  
+
+  bool isWeakLinked = false;
+  std::string functionName(name);
+
+  switch (availability) {
+  case RuntimeAvailability::AlwaysAvailable:
+    // Nothing to do.
+    break;
+  case RuntimeAvailability::ConditionallyAvailable: {
+    isWeakLinked = true;
+    break;
+  }
+  case RuntimeAvailability::AvailableByCompatibilityLibrary: {
+    functionName.append("50");
+    break;
+  }
+  }
+
   llvm::Type *retTy;
   if (retTypes.size() == 1)
     retTy = *retTypes.begin();
@@ -487,17 +650,30 @@ llvm::Constant *swift::getRuntimeFn(llvm::Module &Module,
                                       {argTypes.begin(), argTypes.end()},
                                       /*isVararg*/ false);
 
-  cache = Module.getOrInsertFunction(name, fnTy);
+  auto addr = Module.getOrInsertFunction(functionName.c_str(), fnTy).getCallee();
+  auto fnptr = addr;
+  // Strip off any bitcast we might have due to this function being declared of
+  // a different type previously.
+  if (auto bitcast = dyn_cast<llvm::BitCastInst>(fnptr))
+    fnptr = cast<llvm::Constant>(bitcast->getOperand(0));
+  cache = cast<llvm::Constant>(addr);
 
   // Add any function attributes and set the calling convention.
-  if (auto fn = dyn_cast<llvm::Function>(cache)) {
+  if (auto fn = dyn_cast<llvm::Function>(fnptr)) {
     fn->setCallingConv(cc);
 
-    if (::useDllStorage(llvm::Triple(Module.getTargetTriple())) &&
-        ((fn->getLinkage() == llvm::GlobalValue::ExternalLinkage &&
-          fn->isDeclaration()) ||
-         fn->getLinkage() == llvm::GlobalValue::AvailableExternallyLinkage))
+    bool IsExternal =
+        fn->getLinkage() == llvm::GlobalValue::AvailableExternallyLinkage ||
+        (fn->getLinkage() == llvm::GlobalValue::ExternalLinkage &&
+         fn->isDeclaration());
+
+    if (!isStandardLibrary(Module) && IsExternal &&
+        ::useDllStorage(llvm::Triple(Module.getTargetTriple())))
       fn->setDLLStorageClass(llvm::GlobalValue::DLLImportStorageClass);
+    
+    if (IsExternal && isWeakLinked
+        && !::useDllStorage(llvm::Triple(Module.getTargetTriple())))
+      fn->setLinkage(llvm::GlobalValue::ExternalWeakLinkage);
 
     llvm::AttrBuilder buildFnAttr;
     llvm::AttrBuilder buildRetAttr;
@@ -522,8 +698,8 @@ llvm::Constant *swift::getRuntimeFn(llvm::Module &Module,
 #define QUOTE(...) __VA_ARGS__
 #define STR(X)     #X
 
-#define FUNCTION(ID, NAME, CC, RETURNS, ARGS, ATTRS)                           \
-  FUNCTION_IMPL(ID, NAME, CC, QUOTE(RETURNS), QUOTE(ARGS), QUOTE(ATTRS))
+#define FUNCTION(ID, NAME, CC, AVAILABILITY, RETURNS, ARGS, ATTRS) \
+  FUNCTION_IMPL(ID, NAME, CC, AVAILABILITY, QUOTE(RETURNS), QUOTE(ARGS), QUOTE(ATTRS))
 
 #define RETURNS(...) { __VA_ARGS__ }
 #define ARGS(...) { __VA_ARGS__ }
@@ -531,10 +707,12 @@ llvm::Constant *swift::getRuntimeFn(llvm::Module &Module,
 #define ATTRS(...) { __VA_ARGS__ }
 #define NO_ATTRS {}
 
-#define FUNCTION_IMPL(ID, NAME, CC, RETURNS, ARGS, ATTRS)                      \
+#define FUNCTION_IMPL(ID, NAME, CC, AVAILABILITY, RETURNS, ARGS, ATTRS)        \
   llvm::Constant *IRGenModule::get##ID##Fn() {                                 \
     using namespace RuntimeConstants;                                          \
-    return getRuntimeFn(Module, ID##Fn, #NAME, CC, RETURNS, ARGS, ATTRS);      \
+    return getRuntimeFn(Module, ID##Fn, #NAME, CC,                             \
+                        AVAILABILITY(this->Context),                          \
+                        RETURNS, ARGS, ATTRS);                                 \
   }
 
 #include "swift/Runtime/RuntimeFunctions.def"
@@ -567,18 +745,16 @@ IRGenModule::createStringConstant(StringRef Str,
   return { global, address };
 }
 
-#define KNOWN_METADATA_ACCESSOR(NAME, SYM) \
-llvm::Constant *IRGenModule::get##NAME() { \
-  if (NAME) \
-    return NAME; \
-  NAME = Module.getOrInsertGlobal( \
-                          SYM, \
-                          FullTypeMetadataStructTy); \
-  if (useDllStorage()) \
-    cast<llvm::GlobalVariable>(NAME) \
-        ->setDLLStorageClass(llvm::GlobalValue::DLLImportStorageClass); \
-  return NAME; \
-}
+#define KNOWN_METADATA_ACCESSOR(NAME, SYM)                                     \
+  llvm::Constant *IRGenModule::get##NAME() {                                   \
+    if (NAME)                                                                  \
+      return NAME;                                                             \
+    NAME = Module.getOrInsertGlobal(SYM, FullTypeMetadataStructTy);            \
+    if (useDllStorage() && !isStandardLibrary())                               \
+      ApplyIRLinkage(IRLinkage::ExternalImport)                                \
+          .to(cast<llvm::GlobalVariable>(NAME));                               \
+    return NAME;                                                               \
+  }
 
 KNOWN_METADATA_ACCESSOR(EmptyTupleMetadata,
                         MANGLE_AS_STRING(METADATA_SYM(EMPTY_TUPLE_MANGLING)))
@@ -597,9 +773,8 @@ llvm::Constant *IRGenModule::getObjCEmptyCachePtr() {
     // struct objc_cache _objc_empty_cache;
     ObjCEmptyCachePtr = Module.getOrInsertGlobal("_objc_empty_cache",
                                                  OpaquePtrTy->getElementType());
-    if (useDllStorage())
-      cast<llvm::GlobalVariable>(ObjCEmptyCachePtr)
-          ->setDLLStorageClass(llvm::GlobalValue::DLLImportStorageClass);
+    ApplyIRLinkage(IRLinkage::ExternalImport)
+        .to(cast<llvm::GlobalVariable>(ObjCEmptyCachePtr));
   } else {
     // FIXME: Remove even the null value per rdar://problem/18801263
     ObjCEmptyCachePtr = llvm::ConstantPointerNull::get(OpaquePtrTy);
@@ -630,15 +805,18 @@ Address IRGenModule::getAddrOfObjCISAMask() {
   assert(TargetInfo.hasISAMasking());
   if (!ObjCISAMaskPtr) {
     ObjCISAMaskPtr = Module.getOrInsertGlobal("swift_isaMask", IntPtrTy);
-    if (useDllStorage())
-      cast<llvm::GlobalVariable>(ObjCISAMaskPtr)
-          ->setDLLStorageClass(llvm::GlobalValue::DLLImportStorageClass);
+    ApplyIRLinkage(IRLinkage::ExternalImport)
+        .to(cast<llvm::GlobalVariable>(ObjCISAMaskPtr));
   }
   return Address(ObjCISAMaskPtr, getPointerAlignment());
 }
 
 ModuleDecl *IRGenModule::getSwiftModule() const {
   return IRGen.SIL.getSwiftModule();
+}
+
+AvailabilityContext IRGenModule::getAvailabilityContext() const {
+  return AvailabilityContext::forDeploymentTarget(Context);
 }
 
 Lowering::TypeConverter &IRGenModule::getSILTypes() const {
@@ -661,8 +839,14 @@ bool IRGenerator::canEmitWitnessTableLazily(SILWitnessTable *wt) {
   if (Opts.UseJIT)
     return false;
 
+  // Regardless of the access level, if the witness table is shared it means
+  // we can safely not emit it. Every other module which needs it will generate
+  // its own shared copy of it.
+  if (wt->getLinkage() == SILLinkage::Shared)
+    return true;
+
   NominalTypeDecl *ConformingTy =
-    wt->getConformance()->getType()->getNominalOrBoundGenericNominal();
+    wt->getConformingType()->getNominalOrBoundGenericNominal();
 
   switch (ConformingTy->getEffectiveAccess()) {
     case AccessLevel::Private:
@@ -679,10 +863,11 @@ bool IRGenerator::canEmitWitnessTableLazily(SILWitnessTable *wt) {
 }
 
 void IRGenerator::addLazyWitnessTable(const ProtocolConformance *Conf) {
-  if (SILWitnessTable *wt = SIL.lookUpWitnessTable(Conf)) {
+  if (auto *wt = SIL.lookUpWitnessTable(Conf, /*deserializeLazily=*/false)) {
     // Add it to the queue if it hasn't already been put there.
     if (canEmitWitnessTableLazily(wt) &&
         LazilyEmittedWitnessTables.insert(wt).second) {
+      assert(!FinishedEmittingLazyDefinitions);
       LazyWitnessTables.push_back(wt);
     }
   }
@@ -692,15 +877,8 @@ void IRGenerator::addClassForEagerInitialization(ClassDecl *ClassDecl) {
   if (!ClassDecl->getAttrs().hasAttribute<StaticInitializeObjCMetadataAttr>())
     return;
 
-  // Exclude some classes where those attributes make no sense but could be set
-  // for some reason. Just to be on the safe side.
-  Type ClassTy = ClassDecl->getDeclaredType();
-  if (ClassTy->is<UnboundGenericType>())
-    return;
-  if (ClassTy->hasArchetype())
-    return;
-  if (ClassDecl->hasClangNode())
-    return;
+  assert(!ClassDecl->isGenericContext());
+  assert(!ClassDecl->hasClangNode());
 
   ClassesForEagerInitialization.push_back(ClassDecl);
 }
@@ -722,17 +900,24 @@ bool swift::irgen::shouldRemoveTargetFeature(StringRef feature) {
   return feature == "+thumb-mode";
 }
 
+void IRGenModule::setHasFramePointer(llvm::AttrBuilder &Attrs,
+                                     bool HasFramePointer) {
+  Attrs.addAttribute("frame-pointer", HasFramePointer ? "all" : "none");
+}
+
+void IRGenModule::setHasFramePointer(llvm::Function *F,
+                                     bool HasFramePointer) {
+  llvm::AttrBuilder b;
+  setHasFramePointer(b, HasFramePointer);
+  F->addAttributes(llvm::AttributeList::FunctionIndex, b);
+}
+
 /// Construct initial function attributes from options.
 void IRGenModule::constructInitialFnAttributes(llvm::AttrBuilder &Attrs,
                                                OptimizationMode FuncOptMode) {
-  // Add DisableFPElim. 
-  if (!IRGen.Opts.DisableFPElim) {
-    Attrs.addAttribute("no-frame-pointer-elim", "false");
-  } else {
-    Attrs.addAttribute("no-frame-pointer-elim", "true");
-    Attrs.addAttribute("no-frame-pointer-elim-non-leaf");
-  }
-
+  // Add frame pointer attributes.
+  setHasFramePointer(Attrs, IRGen.Opts.DisableFPElim);
+  
   // Add target-cpu and target-features if they are non-null.
   auto *Clang = static_cast<ClangImporter *>(Context.getClangModuleLoader());
   clang::TargetOptions &ClangOpts = Clang->getTargetInfo().getTargetOpts();
@@ -770,6 +955,10 @@ llvm::AttributeList IRGenModule::constructInitialAttributes() {
                                   llvm::AttributeList::FunctionIndex, b);
 }
 
+llvm::Constant *IRGenModule::getInt32(uint32_t value) {
+  return llvm::ConstantInt::get(Int32Ty, value);
+}
+
 llvm::Constant *IRGenModule::getSize(Size size) {
   return llvm::ConstantInt::get(SizeTy, size.getValue());
 }
@@ -793,8 +982,9 @@ static void appendEncodedName(llvm::SmallVectorImpl<char> &buf,
   appendEncodedName(os, name);
 }
 
-static StringRef encodeForceLoadSymbolName(llvm::SmallVectorImpl<char> &buf,
-                                           StringRef name) {
+StringRef
+swift::irgen::encodeForceLoadSymbolName(llvm::SmallVectorImpl<char> &buf,
+                                        StringRef name) {
   llvm::raw_svector_ostream os{buf};
   os << "_swift_FORCE_LOAD_$";
   appendEncodedName(os, name);
@@ -836,6 +1026,12 @@ llvm::SmallString<32> getTargetDependentLibraryOption(const llvm::Triple &T,
 void IRGenModule::addLinkLibrary(const LinkLibrary &linkLib) {
   llvm::LLVMContext &ctx = Module.getContext();
 
+  // The debugger gets the autolink information directly from
+  // the LinkLibraries of the module, so there's no reason to
+  // emit it into the IR of debugger expressions.
+  if (Context.LangOpts.DebuggerSupport)
+    return;
+  
   switch (linkLib.getKind()) {
   case LibraryKind::Library: {
     llvm::SmallString<32> opt =
@@ -863,11 +1059,15 @@ void IRGenModule::addLinkLibrary(const LinkLibrary &linkLib) {
   if (linkLib.shouldForceLoad()) {
     llvm::SmallString<64> buf;
     encodeForceLoadSymbolName(buf, linkLib.getName());
-    auto ForceImportThunk =
-        Module.getOrInsertFunction(buf, llvm::FunctionType::get(VoidTy, false));
-    if (useDllStorage())
-      cast<llvm::GlobalValue>(ForceImportThunk)
-          ->setDLLStorageClass(llvm::GlobalValue::DLLImportStorageClass);
+    auto ForceImportThunk = cast<llvm::Function>(
+        Module.getOrInsertFunction(buf, llvm::FunctionType::get(VoidTy, false))
+            .getCallee());
+
+    const IRLinkage IRL =
+        llvm::Triple(Module.getTargetTriple()).isOSBinFormatCOFF()
+            ? IRLinkage::ExternalImport
+            : IRLinkage::ExternalWeakImport;
+    ApplyIRLinkage(IRL).to(cast<llvm::GlobalValue>(ForceImportThunk));
 
     buf += "_$";
     appendEncodedName(buf, IRGen.Opts.ModuleName);
@@ -875,9 +1075,9 @@ void IRGenModule::addLinkLibrary(const LinkLibrary &linkLib) {
     if (!Module.getGlobalVariable(buf.str())) {
       auto ref = new llvm::GlobalVariable(Module, ForceImportThunk->getType(),
                                           /*isConstant=*/true,
-                                          llvm::GlobalValue::WeakAnyLinkage,
+                                          llvm::GlobalValue::WeakODRLinkage,
                                           ForceImportThunk, buf.str());
-      ref->setVisibility(llvm::GlobalValue::HiddenVisibility);
+      ApplyIRLinkage(IRLinkage::InternalWeakODR).to(ref);
       auto casted = llvm::ConstantExpr::getBitCast(ref, Int8PtrTy);
       LLVMUsed.push_back(casted);
     }
@@ -954,6 +1154,7 @@ void IRGenModule::emitAutolinkInfo() {
 
   } else {
     assert((TargetInfo.OutputObjectFormat == llvm::Triple::ELF ||
+            TargetInfo.OutputObjectFormat == llvm::Triple::Wasm ||
             Triple.isOSCygMing()) &&
            "expected ELF output format or COFF format for Cygwin/MinGW");
 
@@ -969,7 +1170,13 @@ void IRGenModule::emitAutolinkInfo() {
     }
     auto EntriesConstant = llvm::ConstantDataArray::getString(
         LLVMContext, EntriesString, /*AddNull=*/false);
-
+    // Mark the swift1_autolink_entries section with the SHF_EXCLUDE attribute
+    // to get the linker to drop it in the final linked binary.
+    // LLVM doesn't provide an interface to specify section attributs in the IR
+    // so we pass the attribute with inline assembly.
+    if (TargetInfo.OutputObjectFormat == llvm::Triple::ELF)
+      Module.appendModuleInlineAsm(".section .swift1_autolink_entries,"
+                                   "\"0x80000000\"");
     auto var =
         new llvm::GlobalVariable(*getModule(), EntriesConstant->getType(), true,
                                  llvm::GlobalValue::PrivateLinkage,
@@ -981,16 +1188,17 @@ void IRGenModule::emitAutolinkInfo() {
   }
 
   if (!IRGen.Opts.ForceLoadSymbolName.empty() &&
-      isFirstObjectFileInModule(*this)) {
+      (Triple.supportsCOMDAT() || isFirstObjectFileInModule(*this))) {
     llvm::SmallString<64> buf;
     encodeForceLoadSymbolName(buf, IRGen.Opts.ForceLoadSymbolName);
     auto ForceImportThunk =
         llvm::Function::Create(llvm::FunctionType::get(VoidTy, false),
                                llvm::GlobalValue::ExternalLinkage, buf,
                                &Module);
-    if (useDllStorage())
-      ForceImportThunk
-          ->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
+    ApplyIRLinkage(IRLinkage::ExternalExport).to(ForceImportThunk);
+    if (Triple.supportsCOMDAT())
+      if (auto *GO = cast<llvm::GlobalObject>(ForceImportThunk))
+        GO->setComdat(Module.getOrInsertComdat(ForceImportThunk->getName()));
 
     auto BB = llvm::BasicBlock::Create(getLLVMContext(), "", ForceImportThunk);
     llvm::IRBuilder<> IRB(BB);
@@ -1011,19 +1219,23 @@ void IRGenModule::cleanupClangCodeGenMetadata() {
   // arbitrary keys to put in the image info.
 
   const char *ObjectiveCGarbageCollection = "Objective-C Garbage Collection";
+  uint8_t Major, Minor;
+  std::tie(Major, Minor) = version::getSwiftNumericVersion();
+  uint32_t Value = (Major << 24) | (Minor << 16) | (swiftVersion << 8);
+
   if (Module.getModuleFlag(ObjectiveCGarbageCollection)) {
     bool FoundOldEntry = replaceModuleFlagsEntry(
         Module.getContext(), Module, ObjectiveCGarbageCollection,
         llvm::Module::Override,
         llvm::ConstantAsMetadata::get(
-            llvm::ConstantInt::get(Int32Ty, (uint32_t)(swiftVersion << 8))));
+            llvm::ConstantInt::get(Int32Ty, Value)));
 
     (void)FoundOldEntry;
     assert(FoundOldEntry && "Could not replace old module flag entry?");
   } else
     Module.addModuleFlag(llvm::Module::Override,
                          ObjectiveCGarbageCollection,
-                         (uint32_t)(swiftVersion << 8));
+                         Value);
 }
 
 bool IRGenModule::finalize() {
@@ -1147,9 +1359,20 @@ IRGenModule *IRGenerator::getGenModule(SILFunction *f) {
   return getPrimaryIGM();
 }
 
+uint32_t swift::irgen::getSwiftABIVersion() {
+  return IRGenModule::swiftVersion;
+}
+
 llvm::Triple IRGenerator::getEffectiveClangTriple() {
   auto CI = static_cast<ClangImporter *>(
       &*SIL.getASTContext().getClangModuleLoader());
   assert(CI && "no clang module loader");
   return llvm::Triple(CI->getTargetInfo().getTargetOpts().Triple);
 }
+
+const llvm::DataLayout &IRGenerator::getClangDataLayout() {
+  return static_cast<ClangImporter *>(
+             SIL.getASTContext().getClangModuleLoader())
+      ->getTargetInfo()
+      .getDataLayout();
+  }

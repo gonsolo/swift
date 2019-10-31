@@ -25,7 +25,7 @@ func resyncParser2() {}
 // RUN: %sourcekitd-test -req=cursor -pos=4:13 %s -- %s | %FileCheck -check-prefix=CHECK1 %s
 // CHECK1: source.lang.swift.decl.var.local (4:13-4:14)
 // CHECK1: c
-// CHECK1: <Declaration>let c</Declaration>
+// CHECK1: <Declaration>let c: <Type usr="s:14cursor_invalid1CC">C</Type></Declaration>
 // CHECK1: OVERRIDES BEGIN
 // CHECK1: OVERRIDES END
 
@@ -44,9 +44,9 @@ func resyncParser2() {}
 // CHECK4: bad
 // CHECK4: <Declaration>var bad: IDontExist</Declaration>
 
-// RUN: %sourcekitd-test -req=cursor -pos=7:12 %s -- %s | %FileCheck -check-prefix=EMPTY %s
-// RUN: %sourcekitd-test -req=cursor -pos=9:7 %s -- %s | %FileCheck -check-prefix=EMPTY %s
-// EMPTY: <empty cursor info>
+// RUN: %sourcekitd-test -req=cursor -pos=7:12 %s -- %s | %FileCheck -check-prefix=DIAG %s
+// RUN: %sourcekitd-test -req=cursor -pos=9:7 %s -- %s | %FileCheck -check-prefix=DIAG %s
+// DIAG: <empty cursor info; internal diagnostic: "Unable to resolve cursor info.">
 
 // RUN: %sourcekitd-test -req=cursor -pos=18:6 %s -- %s | %FileCheck -check-prefix=EQEQ1 %s
 // RUN: %sourcekitd-test -req=cursor -pos=19:6 %s -- %s | %FileCheck -check-prefix=EQEQ1 %s

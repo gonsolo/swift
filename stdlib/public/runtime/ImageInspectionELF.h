@@ -19,6 +19,8 @@
 #ifndef SWIFT_RUNTIME_IMAGEINSPECTIONELF_H
 #define SWIFT_RUNTIME_IMAGEINSPECTIONELF_H
 
+#define SWIFT_REFLECTION_METADATA_ELF_NOTE_MAGIC_STRING "swift_reflection_metadata_magic_string"
+
 #if defined(__ELF__)
 
 #include "../SwiftShims/Visibility.h"
@@ -45,13 +47,17 @@ struct MetadataSections {
     size_t length;
   };
 
-  Range swift4_protocols;
-  Range swift4_protocol_conformances;
-  Range swift4_type_metadata;
-  Range swift4_typeref;
-  Range swift4_reflstr;
-  Range swift4_fieldmd;
-  Range swift4_assocty;
+  Range swift5_protocols;
+  Range swift5_protocol_conformances;
+  Range swift5_type_metadata;
+  Range swift5_typeref;
+  Range swift5_reflstr;
+  Range swift5_fieldmd;
+  Range swift5_assocty;
+  Range swift5_replace;
+  Range swift5_replac2;
+  Range swift5_builtin;
+  Range swift5_capture;
 };
 } // namespace swift
 

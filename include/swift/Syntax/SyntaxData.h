@@ -132,18 +132,23 @@ class SyntaxData final
     return {getTrailingObjects<AtomicCache<SyntaxData>>(), getNumChildren()};
   }
 
-  /// Get the node immediately before this current node. Return 0 if we cannot
-  /// find such node.
+public:
+  /// Disable sized deallocation for SyntaxData, because it has tail-allocated
+  /// data.
+  void operator delete(void *p) { ::operator delete(p); }
+
+  /// Get the node immediately before this current node that does contain a
+  /// non-missing token. Return nullptr if we cannot find such node.
   RC<SyntaxData> getPreviousNode() const;
 
-  /// Get the node immediately after this current node. Return 0 if we cannot
-  /// find such node.
+  /// Get the node immediately after this current node that does contain a
+  /// non-missing token. Return nullptr if we cannot find such node.
   RC<SyntaxData> getNextNode() const;
 
-  /// Get the absolute position without skipping the leading trivia of this node.
-  AbsolutePosition getAbsolutePositionWithLeadingTrivia() const;
+  /// Get the first non-missing token node in this tree. Return nullptr if this
+  /// node does not contain non-missing tokens.
+  RC<SyntaxData> getFirstToken() const;
 
-public:
   ~SyntaxData() {
     for (auto &I : getChildren())
       I.~AtomicCache<SyntaxData>();
@@ -177,7 +182,7 @@ public:
                              CursorIndex IndexInParent = 0);
 
   /// Returns the raw syntax node for this syntax node.
-  const RC<RawSyntax> getRaw() const {
+  const RC<RawSyntax> &getRaw() const {
     return Raw;
   }
 
@@ -255,7 +260,11 @@ public:
 
   /// Calculate the absolute end position of this node, use cache of the immediate
   /// next node if populated.
-  AbsolutePosition getAbsoluteEndPosition() const;
+  AbsolutePosition getAbsoluteEndPositionAfterTrailingTrivia() const;
+
+  /// Get the absolute position without skipping the leading trivia of this
+  /// node.
+  AbsolutePosition getAbsolutePositionBeforeLeadingTrivia() const;
 
   /// Returns true if the data node represents type syntax.
   bool isType() const;
@@ -278,6 +287,9 @@ public:
   /// Dump a debug description of the syntax data for debugging to
   /// standard error.
   void dump(llvm::raw_ostream &OS) const;
+
+  LLVM_ATTRIBUTE_DEPRECATED(void dump() const LLVM_ATTRIBUTE_USED,
+                            "Only meant for use in the debugger");
 };
 
 } // end namespace syntax
@@ -287,7 +299,7 @@ public:
 namespace llvm {
   using SD = swift::syntax::SyntaxData;
   using RCSD = swift::RC<SD>;
-  template <> struct llvm::DenseMapInfo<RCSD> {
+  template <> struct DenseMapInfo<RCSD> {
     static inline RCSD getEmptyKey() {
       return SD::make(nullptr, nullptr, 0);
     }

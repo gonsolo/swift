@@ -4,7 +4,7 @@
 
 // First test the explicit frontend-based bridging PCH generation and use works
 // RUN: %target-swift-frontend -emit-pch -o %t/sdk-bridging-header.pch %S/Inputs/sdk-bridging-header.h
-// RUN: %target-swift-frontend -typecheck -verify %s -import-objc-header %t/sdk-bridging-header.pch
+// RUN: %target-typecheck-verify-swift -import-objc-header %t/sdk-bridging-header.pch
 
 // Now test the driver-automated version is inert when disabled
 // RUN: env TMPDIR=%t/tmp/ %target-swiftc_driver -typecheck -disable-bridging-pch -save-temps %s -import-objc-header %S/Inputs/sdk-bridging-header.h
@@ -23,11 +23,11 @@
 
 // Test -emit-pch invocation but with a persistent PCH
 // RUN: %target-swift-frontend -emit-pch -pch-output-dir %t/pch %S/Inputs/sdk-bridging-header.h
-// RUN: %target-swift-frontend -typecheck -verify %s -import-objc-header %S/Inputs/sdk-bridging-header.h -pch-output-dir %t/pch -pch-disable-validation
+// RUN: %target-typecheck-verify-swift -import-objc-header %S/Inputs/sdk-bridging-header.h -pch-output-dir %t/pch -pch-disable-validation
 // RUN: ls %t/pch/*.pch >/dev/null 2>&1
 
 // Test implicit use of persistent PCH
-// RUN: %target-swift-frontend -typecheck -verify %s -import-objc-header %S/Inputs/sdk-bridging-header.h -pch-output-dir %t/pch2
+// RUN: %target-typecheck-verify-swift -import-objc-header %S/Inputs/sdk-bridging-header.h -pch-output-dir %t/pch2
 // RUN: ls %t/pch2/*.pch >/dev/null 2>&1
 
 // RUN: touch %t/header.with.dot.h
@@ -45,6 +45,12 @@
 // Test that -pch-disable-validation works in that it won't implicitely create a PCH
 // RUN: not %target-swift-frontend -typecheck %s -import-objc-header %S/Inputs/sdk-bridging-header.h -pch-output-dir %t/no-pch -pch-disable-validation 2>&1 | %FileCheck %s -check-prefix=NO-VALIDATION
 // NO-VALIDATION: PCH file {{.*}} not found
+
+// Test that -Xcc options are considered in the PCH hash.
+// RUN: %target-swift-frontend -emit-pch -pch-output-dir %t/pch-Xcc %S/Inputs/sdk-bridging-header.h
+// RUN: %target-swift-frontend -emit-pch -pch-output-dir %t/pch-Xcc %S/Inputs/sdk-bridging-header.h -Xcc -Ifoo
+// RUN: %target-swift-frontend -emit-pch -pch-output-dir %t/pch-Xcc %S/Inputs/sdk-bridging-header.h -Xcc -Ibar
+// RUN: ls %t/pch-Xcc/*swift*clang*.pch | count 3
 
 import Foundation
 

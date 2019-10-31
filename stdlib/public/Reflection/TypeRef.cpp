@@ -24,31 +24,30 @@ using namespace swift;
 using namespace reflection;
 
 class PrintTypeRef : public TypeRefVisitor<PrintTypeRef, void> {
-  std::ostream &OS;
+  FILE *file;
   unsigned Indent;
 
-  std::ostream &indent(unsigned Amount) {
+  FILE * &indent(unsigned Amount) {
     for (unsigned i = 0; i < Amount; ++i)
-      OS << ' ';
-    return OS;
+      fprintf(file, " ");
+    return file;
   }
 
-  std::ostream &printHeader(std::string Name) {
-    indent(Indent) << '(' << Name;
-    return OS;
+  FILE * &printHeader(std::string Name) {
+    fprintf(indent(Indent), "(%s", Name.c_str());
+    return file;
   }
 
-  template<typename T>
-  std::ostream &printField(std::string name, const T &value) {
+  FILE * &printField(std::string name, std::string value) {
     if (!name.empty())
-      OS << " " << name << "=" << value;
+      fprintf(file, " %s=%s", name.c_str(), value.c_str());
     else
-      OS << " " << value;
-    return OS;
+      fprintf(file, " %s", value.c_str());
+    return file;
   }
 
   void printRec(const TypeRef *typeRef) {
-    OS << "\n";
+    fprintf(file, "\n");
 
     Indent += 2;
     visit(typeRef);
@@ -56,14 +55,14 @@ class PrintTypeRef : public TypeRefVisitor<PrintTypeRef, void> {
   }
 
 public:
-  PrintTypeRef(std::ostream &OS, unsigned Indent)
-    : OS(OS), Indent(Indent) {}
+  PrintTypeRef(FILE *file, unsigned Indent)
+    : file(file), Indent(Indent) {}
 
   void visitBuiltinTypeRef(const BuiltinTypeRef *B) {
     printHeader("builtin");
     auto demangled = Demangle::demangleTypeAsString(B->getMangledName());
     printField("", demangled);
-    OS << ')';
+    fprintf(file, ")");
   }
 
   void visitNominalTypeRef(const NominalTypeRef *N) {
@@ -86,7 +85,7 @@ public:
     printField("", demangled);
     if (auto parent = N->getParent())
       printRec(parent);
-    OS << ')';
+    fprintf(file, ")");
   }
 
   void visitBoundGenericTypeRef(const BoundGenericTypeRef *BG) {
@@ -105,14 +104,14 @@ public:
       printRec(param);
     if (auto parent = BG->getParent())
       printRec(parent);
-    OS << ')';
+    fprintf(file, ")");
   }
 
   void visitTupleTypeRef(const TupleTypeRef *T) {
     printHeader("tuple");
     for (auto element : T->getElements())
       printRec(element);
-    OS << ')';
+    fprintf(file, ")");
   }
 
   void visitFunctionTypeRef(const FunctionTypeRef *F) {
@@ -132,7 +131,7 @@ public:
       break;
     }
 
-    OS << '\n';
+    fprintf(file, "\n");
     Indent += 2;
     printHeader("parameters");
 
@@ -142,7 +141,7 @@ public:
 
       if (!flags.isNone()) {
         Indent += 2;
-        OS << '\n';
+        fprintf(file, "\n");
       }
 
       switch (flags.getValueOwnership()) {
@@ -167,17 +166,17 @@ public:
 
       if (!flags.isNone()) {
         Indent -= 2;
-        OS << ')';
+        fprintf(file, ")");
       }
     }
 
     if (parameters.empty())
-      OS << ')';
+      fprintf(file, ")");
 
-    OS << '\n';
+    fprintf(file, "\n");
     printHeader("result");
     printRec(F->getResult());
-    OS << ')';
+    fprintf(file, ")");
 
     Indent -= 2;
   }
@@ -185,12 +184,12 @@ public:
   void visitProtocolCompositionTypeRef(const ProtocolCompositionTypeRef *PC) {
     printHeader("protocol_composition");
     if (PC->hasExplicitAnyObject())
-      OS << " any_object";
+      fprintf(file, " any_object");
     if (auto superclass = PC->getSuperclass())
       printRec(superclass);
     for (auto protocol : PC->getProtocols())
       printRec(protocol);
-    OS << ')';
+    fprintf(file, ")");
   }
 
   void visitMetatypeTypeRef(const MetatypeTypeRef *M) {
@@ -198,20 +197,20 @@ public:
     if (M->wasAbstract())
       printField("", "was_abstract");
     printRec(M->getInstanceType());
-    OS << ')';
+    fprintf(file, ")");
   }
 
   void visitExistentialMetatypeTypeRef(const ExistentialMetatypeTypeRef *EM) {
     printHeader("existential_metatype");
     printRec(EM->getInstanceType());
-    OS << ')';
+    fprintf(file, ")");
   }
 
   void visitGenericTypeParameterTypeRef(const GenericTypeParameterTypeRef *GTP){
     printHeader("generic_type_parameter");
-    printField("depth", GTP->getDepth());
-    printField("index", GTP->getIndex());
-    OS << ')';
+    printField("depth", std::to_string(GTP->getDepth()));
+    printField("index", std::to_string(GTP->getIndex()));
+    fprintf(file, ")");
   }
 
   void visitDependentMemberTypeRef(const DependentMemberTypeRef *DM) {
@@ -219,50 +218,47 @@ public:
     printField("protocol", DM->getProtocol());
     printRec(DM->getBase());
     printField("member", DM->getMember());
-    OS << ')';
+    fprintf(file, ")");
   }
 
   void visitForeignClassTypeRef(const ForeignClassTypeRef *F) {
     printHeader("foreign");
     if (!F->getName().empty())
       printField("name", F->getName());
-    OS << ')';
+    fprintf(file, ")");
   }
 
   void visitObjCClassTypeRef(const ObjCClassTypeRef *OC) {
     printHeader("objective_c_class");
     if (!OC->getName().empty())
       printField("name", OC->getName());
-    OS << ')';
+    fprintf(file, ")");
   }
 
-  void visitUnownedStorageTypeRef(const UnownedStorageTypeRef *US) {
-    printHeader("unowned_storage");
-    printRec(US->getType());
-    OS << ')';
+  void visitObjCProtocolTypeRef(const ObjCProtocolTypeRef *OC) {
+    printHeader("objective_c_protocol");
+    if (!OC->getName().empty())
+      printField("name", OC->getName());
+    fprintf(file, ")");
   }
 
-  void visitWeakStorageTypeRef(const WeakStorageTypeRef *WS) {
-    printHeader("weak_storage");
-    printRec(WS->getType());
-    OS << ')';
+#define REF_STORAGE(Name, name, ...) \
+  void visit##Name##StorageTypeRef(const Name##StorageTypeRef *US) { \
+    printHeader(#name "_storage"); \
+    printRec(US->getType()); \
+    fprintf(file, ")"); \
   }
-
-  void visitUnmanagedStorageTypeRef(const UnmanagedStorageTypeRef *US) {
-    printHeader("unmanaged_storage");
-    printRec(US->getType());
-    OS << ')';
-  }
+#include "swift/AST/ReferenceStorage.def"
 
   void visitSILBoxTypeRef(const SILBoxTypeRef *SB) {
     printHeader("sil_box");
     printRec(SB->getBoxedType());
-    OS << ')';
+    fprintf(file, ")");
   }
 
   void visitOpaqueTypeRef(const OpaqueTypeRef *O) {
     printHeader("opaque");
-    OS << ')';
+    fprintf(file, ")");
   }
 };
 
@@ -344,22 +340,20 @@ struct TypeRefIsConcrete
   bool visitObjCClassTypeRef(const ObjCClassTypeRef *OC) {
     return true;
   }
+
+  bool visitObjCProtocolTypeRef(const ObjCProtocolTypeRef *OC) {
+    return true;
+  }
   
   bool visitOpaqueTypeRef(const OpaqueTypeRef *O) {
     return true;
   }
 
-  bool visitUnownedStorageTypeRef(const UnownedStorageTypeRef *US) {
-    return visit(US->getType());
+#define REF_STORAGE(Name, name, ...) \
+  bool visit##Name##StorageTypeRef(const Name##StorageTypeRef *US) { \
+    return visit(US->getType()); \
   }
-
-  bool visitWeakStorageTypeRef(const WeakStorageTypeRef *WS) {
-    return visit(WS->getType());
-  }
-
-  bool visitUnmanagedStorageTypeRef(const UnmanagedStorageTypeRef *US) {
-    return visit(US->getType());
-  }
+#include "swift/AST/ReferenceStorage.def"
 
   bool visitSILBoxTypeRef(const SILBoxTypeRef *SB) {
     return visit(SB->getBoxedType());
@@ -374,12 +368,12 @@ const OpaqueTypeRef *OpaqueTypeRef::get() {
 }
 
 void TypeRef::dump() const {
-  dump(std::cerr);
+  dump(stderr);
 }
 
-void TypeRef::dump(std::ostream &OS, unsigned Indent) const {
-  PrintTypeRef(OS, Indent).visit(this);
-  OS << std::endl;
+void TypeRef::dump(FILE *file, unsigned Indent) const {
+  PrintTypeRef(file, Indent).visit(this);
+  fprintf(file, "\n");
 }
 
 bool TypeRef::isConcrete() const {
@@ -402,7 +396,7 @@ unsigned NominalTypeTrait::getDepth() const {
   return 0;
 }
 
-GenericArgumentMap TypeRef::getSubstMap() const {
+llvm::Optional<GenericArgumentMap> TypeRef::getSubstMap() const {
   GenericArgumentMap Substitutions;
   switch (getKind()) {
     case TypeRefKind::Nominal: {
@@ -415,11 +409,16 @@ GenericArgumentMap TypeRef::getSubstMap() const {
       auto BG = cast<BoundGenericTypeRef>(this);
       auto Depth = BG->getDepth();
       unsigned Index = 0;
-      for (auto Param : BG->getGenericParams())
+      for (auto Param : BG->getGenericParams()) {
+        if (!Param->isConcrete())
+          return None;
         Substitutions.insert({{Depth, Index++}, Param});
+      }
       if (auto Parent = BG->getParent()) {
         auto ParentSubs = Parent->getSubstMap();
-        Substitutions.insert(ParentSubs.begin(), ParentSubs.end());
+        if (!ParentSubs)
+          return None;
+        Substitutions.insert(ParentSubs->begin(), ParentSubs->end());
       }
       break;
     }
@@ -525,18 +524,15 @@ public:
     return OC;
   }
 
-  const TypeRef *visitUnownedStorageTypeRef(const UnownedStorageTypeRef *US) {
-    return US;
+  const TypeRef *visitObjCProtocolTypeRef(const ObjCProtocolTypeRef *OP) {
+    return OP;
   }
 
-  const TypeRef *visitWeakStorageTypeRef(const WeakStorageTypeRef *WS) {
-    return WS;
+#define REF_STORAGE(Name, name, ...) \
+  const TypeRef *visit##Name##StorageTypeRef(const Name##StorageTypeRef *US) { \
+    return US; \
   }
-
-  const TypeRef *
-  visitUnmanagedStorageTypeRef(const UnmanagedStorageTypeRef *US) {
-    return US;
-  }
+#include "swift/AST/ReferenceStorage.def"
 
   const TypeRef *visitSILBoxTypeRef(const SILBoxTypeRef *SB) {
     return SILBoxTypeRef::create(Builder, visit(SB->getBoxedType()));
@@ -659,8 +655,7 @@ public:
       if (auto *Nominal = dyn_cast<NominalTypeRef>(SubstBase)) {
         TypeWitness = Builder.lookupTypeWitness(Nominal->getMangledName(),
                                                 Member, Protocol);
-      } else {
-        auto BG = cast<BoundGenericTypeRef>(SubstBase);
+      } else if (auto *BG = dyn_cast<BoundGenericTypeRef>(SubstBase)) {
         TypeWitness = Builder.lookupTypeWitness(BG->getMangledName(),
                                                 Member, Protocol);
       }
@@ -676,15 +671,24 @@ public:
       SubstBase = Superclass;
     }
 
+    auto Protocol = std::make_pair(DM->getProtocol(), false);
+
     // We didn't find the member type, so return something to let the
     // caller know we're dealing with incomplete metadata.
     if (TypeWitness == nullptr)
       return Builder.createDependentMemberType(DM->getMember(),
                                                SubstBase,
-                                               DM->getProtocol());
+                                               Protocol);
+
+    // Likewise if we can't get the substitution map.
+    auto SubstMap = SubstBase->getSubstMap();
+    if (!SubstMap)
+      return Builder.createDependentMemberType(DM->getMember(),
+                                               SubstBase,
+                                               Protocol);
 
     // Apply base type substitutions to get the fully-substituted nested type.
-    auto *Subst = TypeWitness->subst(Builder, SubstBase->getSubstMap());
+    auto *Subst = TypeWitness->subst(Builder, *SubstMap);
 
     // Same as above.
     return thickenMetatypes(Builder, Subst);
@@ -698,18 +702,15 @@ public:
     return OC;
   }
 
-  const TypeRef *visitUnownedStorageTypeRef(const UnownedStorageTypeRef *US) {
-    return UnownedStorageTypeRef::create(Builder, visit(US->getType()));
+  const TypeRef *visitObjCProtocolTypeRef(const ObjCProtocolTypeRef *OP) {
+    return OP;
   }
 
-  const TypeRef *visitWeakStorageTypeRef(const WeakStorageTypeRef *WS) {
-    return WeakStorageTypeRef::create(Builder, visit(WS->getType()));
+#define REF_STORAGE(Name, name, ...) \
+  const TypeRef *visit##Name##StorageTypeRef(const Name##StorageTypeRef *US) { \
+    return Name##StorageTypeRef::create(Builder, visit(US->getType())); \
   }
-
-  const TypeRef *
-  visitUnmanagedStorageTypeRef(const UnmanagedStorageTypeRef *US) {
-    return UnmanagedStorageTypeRef::create(Builder, visit(US->getType()));
-  }
+#include "swift/AST/ReferenceStorage.def"
 
   const TypeRef *visitSILBoxTypeRef(const SILBoxTypeRef *SB) {
     return SILBoxTypeRef::create(Builder, visit(SB->getBoxedType()));

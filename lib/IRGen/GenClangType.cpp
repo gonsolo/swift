@@ -53,7 +53,7 @@ public:
 static CanType getNamedSwiftType(ModuleDecl *stdlib, StringRef name) {
   auto &ctx = stdlib->getASTContext();
   SmallVector<ValueDecl*, 1> results;
-  stdlib->lookupValue({}, ctx.getIdentifier(name), NLKind::QualifiedLookup,
+  stdlib->lookupValue(ctx.getIdentifier(name), NLKind::QualifiedLookup,
                       results);
 
   // If we have one single type decl, and that decl has been
@@ -64,8 +64,7 @@ static CanType getNamedSwiftType(ModuleDecl *stdlib, StringRef name) {
   // that's a real thing.
   if (results.size() == 1) {
     if (auto typeDecl = dyn_cast<TypeDecl>(results[0]))
-      if (typeDecl->hasInterfaceType())
-        return typeDecl->getDeclaredInterfaceType()->getCanonicalType();
+      return typeDecl->getDeclaredInterfaceType()->getCanonicalType();
   }
   return CanType();
 }
@@ -82,6 +81,14 @@ getClangBuiltinTypeFromKind(const clang::ASTContext &context,
   case clang::BuiltinType::Id:                                                 \
     return context.SingletonId;
 #include "clang/Basic/OpenCLImageTypes.def"
+#define EXT_OPAQUE_TYPE(ExtType, Id, Ext)                                      \
+  case clang::BuiltinType::Id:                                                 \
+    return context.Id##Ty;
+#include "clang/Basic/OpenCLExtensionTypes.def"
+#define SVE_TYPE(Name, Id, SingletonId)                                        \
+  case clang::BuiltinType::Id:                                                 \
+    return context.SingletonId;
+#include "clang/Basic/AArch64SVEACLETypes.def"
   }
 
   llvm_unreachable("Not a valid BuiltinType.");
@@ -152,8 +159,6 @@ public:
   clang::CanQualType visitBuiltinRawPointerType(CanBuiltinRawPointerType type);
   clang::CanQualType visitBuiltinIntegerType(CanBuiltinIntegerType type);
   clang::CanQualType visitBuiltinFloatType(CanBuiltinFloatType type);
-  clang::CanQualType visitBuiltinUnknownObjectType(
-                                                CanBuiltinUnknownObjectType type);
   clang::CanQualType visitArchetypeType(CanArchetypeType type);
   clang::CanQualType visitSILFunctionType(CanSILFunctionType type);
   clang::CanQualType visitGenericTypeParamType(CanGenericTypeParamType type);
@@ -216,6 +221,7 @@ clang::CanQualType GenClangType::visitStructType(CanStructType type) {
   CHECK_NAMED_TYPE(swiftDecl->getASTContext().getSwiftName(
                      KnownFoundationEntity::NSZone),
                    ctx.VoidPtrTy);
+  CHECK_NAMED_TYPE("WindowsBool", ctx.IntTy);
   CHECK_NAMED_TYPE("ObjCBool", ctx.ObjCBuiltinBoolTy);
   CHECK_NAMED_TYPE("Selector", getClangSelectorType(ctx));
   CHECK_NAMED_TYPE("UnsafeRawPointer", ctx.VoidPtrTy);
@@ -453,6 +459,7 @@ GenClangType::visitBoundGenericType(CanBoundGenericType type) {
     AutoreleasingUnsafeMutablePointer,
     Unmanaged,
     CFunctionPointer,
+    SIMD,
   } kind = llvm::StringSwitch<StructKind>(swiftStructDecl->getName().str())
     .Case("UnsafeMutablePointer", StructKind::UnsafeMutablePointer)
     .Case("UnsafePointer", StructKind::UnsafePointer)
@@ -461,6 +468,7 @@ GenClangType::visitBoundGenericType(CanBoundGenericType type) {
         StructKind::AutoreleasingUnsafeMutablePointer)
     .Case("Unmanaged", StructKind::Unmanaged)
     .Case("CFunctionPointer", StructKind::CFunctionPointer)
+    .StartsWith("SIMD", StructKind::SIMD)
     .Default(StructKind::Invalid);
   
   auto args = type.getGenericArgs();
@@ -472,7 +480,7 @@ GenClangType::visitBoundGenericType(CanBoundGenericType type) {
   case StructKind::Invalid:
     llvm_unreachable("Unexpected non-pointer generic struct type in imported"
                      " Clang module!");
-      
+    
   case StructKind::UnsafeMutablePointer:
   case StructKind::Unmanaged:
   case StructKind::AutoreleasingUnsafeMutablePointer: {
@@ -498,6 +506,19 @@ GenClangType::visitBoundGenericType(CanBoundGenericType type) {
     }
     auto fnPtrTy = clangCtx.getPointerType(functionTy);
     return getCanonicalType(fnPtrTy);
+  }
+    
+  case StructKind::SIMD: {
+    clang::QualType scalarTy = Converter.convert(IGM, loweredArgTy);
+    auto numEltsString = swiftStructDecl->getName().str();
+    numEltsString.consume_front("SIMD");
+    unsigned numElts;
+    bool failedParse = numEltsString.getAsInteger<unsigned>(10, numElts);
+    assert(!failedParse && "SIMD type name didn't end in count?");
+    (void) failedParse;
+    auto vectorTy = getClangASTContext().getVectorType(scalarTy, numElts,
+      clang::VectorType::VectorKind::GenericVector);
+    return getCanonicalType(vectorTy);
   }
   }
 
@@ -555,7 +576,8 @@ clang::CanQualType GenClangType::visitSILFunctionType(CanSILFunctionType type) {
   if (allResults.empty()) {
     resultType = clangCtx.VoidTy;
   } else {
-    resultType = Converter.convert(IGM, allResults[0].getType());
+    resultType = Converter.convert(IGM,
+                   allResults[0].getReturnValueType(IGM.getSILModule(), type));
     if (resultType.isNull())
       return clang::CanQualType();
   }
@@ -578,7 +600,8 @@ clang::CanQualType GenClangType::visitSILFunctionType(CanSILFunctionType type) {
     case ParameterConvention::Indirect_In_Guaranteed:
       llvm_unreachable("block takes indirect parameter");
     }
-    auto param = Converter.convert(IGM, paramTy.getType());
+    auto param = Converter.convert(IGM,
+                             paramTy.getArgumentType(IGM.getSILModule(), type));
     if (param.isNull())
       return clang::CanQualType();
     paramTypes.push_back(param);
@@ -623,10 +646,10 @@ clang::CanQualType GenClangType::visitProtocolCompositionType(
     return getClangIdType(getClangASTContext());
 
   auto superclassTy = clangCtx.ObjCBuiltinIdTy;
-  if (layout.superclass) {
+  if (auto layoutSuperclassTy = layout.getSuperclass()) {
     superclassTy = clangCtx.getCanonicalType(
       cast<clang::ObjCObjectPointerType>(
-        Converter.convert(IGM, CanType(layout.superclass)))
+        Converter.convert(IGM, CanType(layoutSuperclassTy)))
         ->getPointeeType());
   }
 
@@ -681,13 +704,6 @@ clang::CanQualType GenClangType::visitBuiltinFloatType(
   if (format == &clangTargetInfo.getDoubleFormat()) return ctx.DoubleTy;
   if (format == &clangTargetInfo.getLongDoubleFormat()) return ctx.LongDoubleTy;
   llvm_unreachable("cannot translate floating-point format to C");
-}
-
-clang::CanQualType GenClangType::visitBuiltinUnknownObjectType(
-  CanBuiltinUnknownObjectType type) {
-  auto &clangCtx = getClangASTContext();
-  auto ptrTy = clangCtx.getObjCObjectPointerType(clangCtx.VoidTy);
-  return clangCtx.getCanonicalType(ptrTy);
 }
 
 clang::CanQualType GenClangType::visitArchetypeType(CanArchetypeType type) {
@@ -759,11 +775,13 @@ clang::CanQualType IRGenModule::getClangType(SILType type) {
   return getClangType(type.getASTType());
 }
 
-clang::CanQualType IRGenModule::getClangType(SILParameterInfo params) {
-  auto clangType = getClangType(params.getSILStorageType());
+clang::CanQualType IRGenModule::getClangType(SILParameterInfo params,
+                                             CanSILFunctionType funcTy) {
+  auto paramTy = params.getSILStorageType(getSILModule(), funcTy);
+  auto clangType = getClangType(paramTy);
   // @block_storage types must be @inout_aliasable and have
   // special lowering
-  if (!params.getSILStorageType().is<SILBlockStorageType>()) {
+  if (!paramTy.is<SILBlockStorageType>()) {
     if (params.isIndirectMutating()) {
       return getClangASTContext().getPointerType(clangType);
     }

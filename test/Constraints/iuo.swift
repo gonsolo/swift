@@ -210,7 +210,7 @@ func conditionalDowncastToOptional(b: B?) -> D? {
 }
 
 func conditionalDowncastToObject(b: B?) -> D {
-  return b as? D! // expected-error {{value of optional type 'D?' not unwrapped; did you mean to use '!' or '?'?}}
+  return b as? D! // expected-error {{cannot convert return expression of type 'D??' to return type 'D'}}
   // expected-warning@-1 {{using '!' here is deprecated and will be removed in a future release}}
 }
 

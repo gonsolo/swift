@@ -17,6 +17,7 @@
 #ifndef SWIFT_PARSE_PERSISTENTPARSERSTATE_H
 #define SWIFT_PARSE_PERSISTENTPARSERSTATE_H
 
+#include "swift/AST/LazyResolver.h"
 #include "swift/Basic/SourceLoc.h"
 #include "swift/Parse/LocalContext.h"
 #include "swift/Parse/ParserPosition.h"
@@ -26,7 +27,7 @@
 namespace swift {
   class AbstractFunctionDecl;
 
-/// \brief Parser state persistent across multiple parses.
+/// Parser state persistent across multiple parses.
 class PersistentParserState {
 public:
   struct ParserPos {
@@ -50,23 +51,6 @@ public:
                       SavedScope &&Scope)
       : BodyPos{BodyRange.Start, PreviousLoc}, Scope(std::move(Scope))
     {}
-  };
-
-  class AccessorBodyState {
-    ParserPos BodyPos;
-    SavedScope Scope;
-    SourceLoc LBLoc;
-    friend class Parser;
-
-    SavedScope takeScope() {
-      return std::move(Scope);
-    }
-
-  public:
-    AccessorBodyState(SourceRange BodyRange, SourceLoc PreviousLoc,
-                      SavedScope &&Scope, SourceLoc LBLoc)
-        : BodyPos{BodyRange.Start, PreviousLoc}, Scope(std::move(Scope)),
-          LBLoc(LBLoc) {}
   };
 
   enum class DelayedDeclKind {
@@ -109,40 +93,27 @@ private:
                      std::unique_ptr<FunctionBodyState>>;
   DelayedFunctionBodiesTy DelayedFunctionBodies;
 
-  using DelayedAccessorBodiesTy =
-      llvm::DenseMap<AbstractFunctionDecl *,
-                     std::unique_ptr<AccessorBodyState>>;
-  DelayedAccessorBodiesTy DelayedAccessorBodies;
-
-  /// \brief Parser sets this if it stopped parsing before the buffer ended.
+  /// Parser sets this if it stopped parsing before the buffer ended.
   ParserPosition MarkedPos;
 
   std::unique_ptr<DelayedDeclState> CodeCompletionDelayedDeclState;
+
+  std::vector<IterableDeclContext *> DelayedDeclLists;
 
   /// The local context for all top-level code.
   TopLevelContext TopLevelCode;
 
 public:
   swift::ScopeInfo &getScopeInfo() { return ScopeInfo; }
-
-  void delayFunctionBodyParsing(AbstractFunctionDecl *AFD,
-                                SourceRange BodyRange,
-                                SourceLoc PreviousLoc);
-  std::unique_ptr<FunctionBodyState>
-  takeFunctionBodyState(AbstractFunctionDecl *AFD);
-
-  bool hasFunctionBodyState(AbstractFunctionDecl *AFD);
-
-  void delayAccessorBodyParsing(AbstractFunctionDecl *AFD,
-                                SourceRange BodyRange,
-                                SourceLoc PreviousLoc,
-                                SourceLoc LBLoc);
-  std::unique_ptr<AccessorBodyState>
-  takeAccessorBodyState(AbstractFunctionDecl *AFD);
+  PersistentParserState();
+  PersistentParserState(ASTContext &ctx) : PersistentParserState() { }
+  ~PersistentParserState();
 
   void delayDecl(DelayedDeclKind Kind, unsigned Flags,
                  DeclContext *ParentContext,
                  SourceRange BodyRange, SourceLoc PreviousLoc);
+
+  void delayDeclList(IterableDeclContext *D);
 
   void delayTopLevel(TopLevelCodeDecl *TLCD, SourceRange BodyRange,
                      SourceLoc PreviousLoc);
@@ -163,6 +134,8 @@ public:
     return std::move(CodeCompletionDelayedDeclState);
   }
 
+  void parseAllDelayedDeclLists();
+
   TopLevelContext &getTopLevelContext() {
     return TopLevelCode;
   }
@@ -173,7 +146,7 @@ public:
     this->InPoundLineEnvironment = InPoundLineEnvironment;
   }
 
-  /// \brief Returns the marked parser position and resets it.
+  /// Returns the marked parser position and resets it.
   ParserPosition takeParserPosition() {
     ParserPosition Pos = MarkedPos;
     MarkedPos = ParserPosition();

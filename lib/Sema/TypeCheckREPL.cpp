@@ -21,6 +21,7 @@
 #include "swift/AST/Expr.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/ParameterList.h"
+#include "swift/AST/SourceFile.h"
 #include "swift/AST/Stmt.h"
 #include "swift/Parse/LocalContext.h"
 #include "llvm/ADT/SmallString.h"
@@ -45,8 +46,8 @@ struct REPLContext {
 
     {
       Identifier Id(Context.getIdentifier("_replPrintLiteralString"));
-      auto lookup = TC.lookupUnqualified(TC.getStdlibModule(&SF),
-                                         Id, SourceLoc());
+      auto lookup = TypeChecker::lookupUnqualified(TC.getStdlibModule(&SF), Id,
+                                                   SourceLoc());
       if (!lookup)
         return true;
       for (auto result : lookup)
@@ -54,8 +55,8 @@ struct REPLContext {
     }
     {
       Identifier Id(Context.getIdentifier("_replDebugPrintln"));
-      auto lookup = TC.lookupUnqualified(TC.getStdlibModule(&SF),
-                                         Id, SourceLoc());
+      auto lookup = TypeChecker::lookupUnqualified(TC.getStdlibModule(&SF), Id,
+                                                   SourceLoc());
       if (!lookup)
         return true;
       for (auto result : lookup)
@@ -230,9 +231,10 @@ void REPLChecker::generatePrintOfExpression(StringRef NameStr, Expr *E) {
 
   // Build function of type T->() which prints the operand.
   auto *Arg = new (Context) ParamDecl(
-      VarDecl::Specifier::Default, SourceLoc(), SourceLoc(), Identifier(), Loc,
-      Context.getIdentifier("arg"), E->getType(), /*DC*/ newTopLevel);
+      SourceLoc(), SourceLoc(), Identifier(), Loc,
+      Context.getIdentifier("arg"), /*DC*/ newTopLevel);
   Arg->setInterfaceType(E->getType());
+  Arg->setSpecifier(ParamSpecifier::Default);
   auto params = ParameterList::createWithoutLoc(Arg);
 
   unsigned discriminator = TLC.claimNextClosureDiscriminator();
@@ -241,9 +243,10 @@ void REPLChecker::generatePrintOfExpression(StringRef NameStr, Expr *E) {
       new (Context) ClosureExpr(params, SourceLoc(), SourceLoc(), SourceLoc(),
                                 TypeLoc(), discriminator, newTopLevel);
 
-  CE->setType(ParameterList::getFullInterfaceType(
-      TupleType::getEmpty(Context), params, Context));
-  
+  SmallVector<AnyFunctionType::Param, 1> args;
+  params->getParams(args);
+  CE->setType(FunctionType::get(args, TupleType::getEmpty(Context)));
+
   // Convert the pattern to a string we can print.
   llvm::SmallString<16> PrefixString;
   PrefixString += "// ";
@@ -267,16 +270,17 @@ void REPLChecker::generatePrintOfExpression(StringRef NameStr, Expr *E) {
   BraceStmt *Body = builder.createBodyStmt(Loc, EndLoc);
   CE->setBody(Body, false);
   TC.typeCheckClosureBody(CE);
+  TC.ClosuresWithUncomputedCaptures.push_back(CE);
 
   auto *TheCall = CallExpr::createImplicit(Context, CE, { E }, { });
-  TheCall->getArg()->setType(ParenType::get(Context, E->getType()));
+  TheCall->getArg()->setType(AnyFunctionType::composeInput(Context, args, false));
   TheCall->setType(Context.TheEmptyTupleType);
 
   // Inject the call into the top level stream by wrapping it with a TLCD.
   auto *BS = BraceStmt::create(Context, Loc, ASTNode(TheCall),
                                EndLoc);
   newTopLevel->setBody(BS);
-  TC.checkTopLevelErrorHandling(newTopLevel);
+  TypeChecker::checkTopLevelErrorHandling(newTopLevel);
 
   SF.Decls.push_back(newTopLevel);
 }
@@ -306,11 +310,10 @@ void REPLChecker::processREPLTopLevelExpr(Expr *E) {
   E = TC.coerceToRValue(E);
 
   // Create the meta-variable, let the typechecker name it.
-  Identifier name = TC.getNextResponseVariableName(SF.getParentModule());
-  VarDecl *vd = new (Context) VarDecl(/*IsStatic*/false,
-                                      VarDecl::Specifier::Let,
+  Identifier name = TC.getNextResponseVariableName(&SF);
+  VarDecl *vd = new (Context) VarDecl(/*IsStatic*/false, VarDecl::Introducer::Let,
                                       /*IsCaptureList*/false, E->getStartLoc(),
-                                      name, E->getType(), &SF);
+                                      name, &SF);
   vd->setInterfaceType(E->getType());
   SF.Decls.push_back(vd);
 
@@ -318,9 +321,10 @@ void REPLChecker::processREPLTopLevelExpr(Expr *E) {
   Pattern *metavarPat = new (Context) NamedPattern(vd);
   metavarPat->setType(E->getType());
 
-  PatternBindingDecl *metavarBinding
-    = PatternBindingDecl::create(Context, SourceLoc(), StaticSpellingKind::None,
-                                 E->getStartLoc(), metavarPat, E, TLCD);
+  PatternBindingDecl *metavarBinding = PatternBindingDecl::create(
+      Context, /*StaticLoc*/ SourceLoc(), StaticSpellingKind::None,
+      /*VarLoc*/ E->getStartLoc(), metavarPat, /*EqualLoc*/ SourceLoc(), E,
+      TLCD);
 
   // Overwrite the body of the existing TopLevelCodeDecl.
   TLCD->setBody(BraceStmt::create(Context,
@@ -342,15 +346,14 @@ void REPLChecker::processREPLTopLevelPatternBinding(PatternBindingDecl *PBD) {
   // This would just cause a confusing definite initialization error.  Some
   // day we will do some high level analysis of uninitialized variables
   // (rdar://15157729) but until then, output a specialized error.
-  unsigned entryIdx = 0U-1;
-  for (auto patternEntry : PBD->getPatternList()) {
-    ++entryIdx;
-    if (!patternEntry.getInit()) {
+  for (auto entryIdx : range(PBD->getNumPatternEntries())) {
+    auto *entryInit = PBD->getInit(entryIdx);
+    if (!entryInit) {
       TC.diagnose(PBD->getStartLoc(), diag::repl_must_be_initialized);
       continue;
     }
 
-    auto pattern = patternEntry.getPattern();
+    auto *pattern = PBD->getPattern(entryIdx);
     
     llvm::SmallString<16> PatternString;
     PatternBindingPrintLHS(PatternString).visit(pattern);
@@ -382,22 +385,20 @@ void REPLChecker::processREPLTopLevelPatternBinding(PatternBindingDecl *PBD) {
     // Create the meta-variable, let the typechecker name it.
     Identifier name = TC.getNextResponseVariableName(SF.getParentModule());
     VarDecl *vd = new (Context) VarDecl(/*IsStatic*/false,
-                                        VarDecl::Specifier::Let,
+                                        VarDecl::Introducer::Let,
                                         /*IsCaptureList*/false,
-                                        PBD->getStartLoc(), name,
-                                        pattern->getType(), &SF);
+                                        PBD->getStartLoc(), name, &SF);
     vd->setInterfaceType(pattern->getType());
     SF.Decls.push_back(vd);
 
     // Create a PatternBindingDecl to bind the expression into the decl.
     Pattern *metavarPat = new (Context) NamedPattern(vd);
     metavarPat->setType(vd->getType());
-    PatternBindingDecl *metavarBinding
-      = PatternBindingDecl::create(Context, SourceLoc(),
-                                   StaticSpellingKind::None,
-                                   PBD->getStartLoc(), metavarPat,
-                                   patternEntry.getInit(), &SF);
-    
+    auto *metavarBinding = PatternBindingDecl::create(
+        Context, /*StaticLoc*/ SourceLoc(), StaticSpellingKind::None,
+        /*VarLoc*/ PBD->getStartLoc(), metavarPat, /*EqualLoc*/ SourceLoc(),
+        entryInit, &SF);
+
     auto MVBrace = BraceStmt::create(Context, metavarBinding->getStartLoc(),
                                      ASTNode(metavarBinding),
                                      metavarBinding->getEndLoc());
@@ -450,8 +451,9 @@ void TypeChecker::processREPLTopLevel(SourceFile &SF, TopLevelContext &TLC,
     else if (auto *D = Entry.dyn_cast<Decl*>())
       if (auto *PBD = dyn_cast<PatternBindingDecl>(D))
         RC.processREPLTopLevelPatternBinding(PBD);
+
+    contextualizeTopLevelCode(TLC, TLCD);
   }
 
-  contextualizeTopLevelCode(TLC, llvm::makeArrayRef(SF.Decls).slice(FirstDecl));
+  SF.clearLookupCache();
 }
-

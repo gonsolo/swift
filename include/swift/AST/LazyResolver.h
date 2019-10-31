@@ -33,7 +33,6 @@ class NominalTypeDecl;
 class NormalProtocolConformance;
 class ProtocolConformance;
 class ProtocolDecl;
-class Substitution;
 class TypeDecl;
 class ValueDecl;
 class VarDecl;
@@ -54,61 +53,11 @@ public:
   virtual void resolveWitness(const NormalProtocolConformance *conformance,
                               ValueDecl *requirement) = 0;
 
-  /// Resolve the access of a value.
-  ///
-  /// It does no type-checking.
-  virtual void resolveAccessControl(ValueDecl *VD) = 0;
-
-  /// Resolve the type and declaration attributes of a value.
-  ///
-  /// This can be called when the type or signature of a value is needed.
-  /// It does not perform full type-checking, only checks for basic
-  /// consistency and provides the value a type.
-  virtual void resolveDeclSignature(ValueDecl *VD) = 0;
-
-  /// Resolve the types in the inheritance clause of the given
-  /// declaration context, which will be a type declaration or
-  /// extension declaration.
-  virtual void resolveInheritanceClause(
-                 llvm::PointerUnion<TypeDecl *, ExtensionDecl *> decl) = 0;
-
-  /// Resolve the superclass of the given class.
-  virtual void resolveSuperclass(ClassDecl *classDecl) = 0;
-
-  /// Resolve the raw type of the given enum.
-  virtual void resolveRawType(EnumDecl *enumDecl) = 0;
-
-  /// Resolve the inherited protocols of a given protocol.
-  virtual void resolveInheritedProtocols(ProtocolDecl *protocol) = 0;
-
-  /// Bind an extension to its extended type.
-  virtual void bindExtension(ExtensionDecl *ext) = 0;
-
-  /// Resolve the type of an extension.
-  ///
-  /// This can be called to ensure that the members of an extension can be
-  /// considered to be members of the extended type.
-  virtual void resolveExtension(ExtensionDecl *ext) = 0;
-
-  using ConformanceConstructionInfo = std::pair<SourceLoc, ProtocolDecl *>;
-  /// Resolve enough of an extension to find which protocols it is declaring
-  /// conformance to.
-  ///
-  /// This can be called to ensure that the "extension Foo: Bar, Baz" part of
-  /// the extension is understood.
-  virtual void resolveExtensionForConformanceConstruction(
-      ExtensionDecl *ext,
-      SmallVectorImpl<ConformanceConstructionInfo> &protocols) = 0;
-
   /// Resolve any implicitly-declared constructors within the given nominal.
   virtual void resolveImplicitConstructors(NominalTypeDecl *nominal) = 0;
 
   /// Resolve an implicitly-generated member with the given name.
   virtual void resolveImplicitMember(NominalTypeDecl *nominal, DeclName member) = 0;
-
-  /// Mark the given conformance as "used" from the given declaration context.
-  virtual void markConformanceUsed(ProtocolConformanceRef conformance,
-                                   DeclContext *dc) = 0;
 };
 
 class LazyMemberLoader;
@@ -120,15 +69,8 @@ public:
   LazyMemberLoader *loader;
 };
 
-/// Context data for generic contexts.
-class LazyGenericContextData : public LazyContextData {
-public:
-  /// The context data used for loading the generic environment.
-  uint64_t genericEnvData = 0;
-};
-
 /// Context data for iterable decl contexts.
-class LazyIterableDeclContextData : public LazyGenericContextData {
+class LazyIterableDeclContextData : public LazyContextData {
 public:
   /// The context data used for loading all of the members of the iterable
   /// context.
@@ -137,6 +79,14 @@ public:
   /// The context data used for loading all of the conformances of the
   /// iterable context.
   uint64_t allConformancesData = 0;
+};
+
+/// Context data for protocols.
+class LazyProtocolData : public LazyIterableDeclContextData {
+public:
+  /// The context data used for loading all of the members of the iterable
+  /// context.
+  uint64_t requirementSignatureData = 0;
 };
 
 /// A class that can lazily load members from a serialized format.
@@ -169,12 +119,13 @@ public:
                       SmallVectorImpl<ProtocolConformance *> &Conformances) = 0;
 
   /// Returns the default definition type for \p ATD.
-  virtual TypeLoc loadAssociatedTypeDefault(const AssociatedTypeDecl *ATD,
-                                            uint64_t contextData) = 0;
+  virtual Type loadAssociatedTypeDefault(const AssociatedTypeDecl *ATD,
+                                         uint64_t contextData) = 0;
 
-  /// Returns the generic environment.
-  virtual GenericEnvironment *loadGenericEnvironment(const DeclContext *decl,
-                                                     uint64_t contextData) = 0;
+  /// Loads the requirement signature for a protocol.
+  virtual void
+  loadRequirementSignature(const ProtocolDecl *proto, uint64_t contextData,
+                           SmallVectorImpl<Requirement> &requirements) = 0;
 };
 
 /// A class that can lazily load conformances from a serialized format.

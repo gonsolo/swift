@@ -159,6 +159,19 @@ public:
   }
 
   /// Returns the canonical AST type referenced by this SIL type.
+  ///
+  /// NOTE:
+  /// 1. The returned AST type may not be a proper formal type.
+  ///    For example, it may contain a SILFunctionType instead of a
+  ///    FunctionType.
+  /// 2. The returned type may not be the same as the original
+  ///    unlowered type that produced this SILType (even after
+  ///    canonicalization). If you need it, you must pass it separately.
+  ///    For example, `AnyObject.Type` may get lowered to
+  ///    `$@thick AnyObject.Type`, for which the AST type will be
+  ///    `@thick AnyObject.Type`.
+  ///    More generally, you cannot recover a formal type from
+  ///    a lowered type. See docs/SIL.rst for more details.
   CanType getASTType() const {
     return CanType(value.getPointer());
   }
@@ -228,55 +241,57 @@ public:
   /// something of unknown size.
   ///
   /// This is equivalent to, but possibly faster than, calling
-  /// M.Types.getTypeLowering(type).isAddressOnly().
-  static bool isAddressOnly(CanType T, SILModule &M,
-                            CanGenericSignature Sig,
-                            ResilienceExpansion Expansion);
+  /// tc.getTypeLowering(type).isAddressOnly().
+  static bool isAddressOnly(CanType type, Lowering::TypeConverter &tc,
+                            CanGenericSignature sig,
+                            ResilienceExpansion expansion);
+
   /// Return true if this type must be returned indirectly.
   ///
   /// This is equivalent to, but possibly faster than, calling
-  /// M.Types.getTypeLowering(type).isReturnedIndirectly().
-  static bool isFormallyReturnedIndirectly(CanType type, SILModule &M,
-                                           CanGenericSignature Sig,
-                                           ResilienceExpansion Expansion) {
-    return isAddressOnly(type, M, Sig, Expansion);
+  /// tc.getTypeLowering(type).isReturnedIndirectly().
+  static bool isFormallyReturnedIndirectly(CanType type,
+                                           Lowering::TypeConverter &tc,
+                                           CanGenericSignature sig) {
+    return isAddressOnly(type, tc, sig, ResilienceExpansion::Minimal);
   }
 
   /// Return true if this type must be passed indirectly.
   ///
   /// This is equivalent to, but possibly faster than, calling
-  /// M.Types.getTypeLowering(type).isPassedIndirectly().
-  static bool isFormallyPassedIndirectly(CanType type, SILModule &M,
-                                         CanGenericSignature Sig,
-                                         ResilienceExpansion Expansion) {
-    return isAddressOnly(type, M, Sig, Expansion);
+  /// tc.getTypeLowering(type).isPassedIndirectly().
+  static bool isFormallyPassedIndirectly(CanType type,
+                                         Lowering::TypeConverter &tc,
+                                         CanGenericSignature sig) {
+    return isAddressOnly(type, tc, sig, ResilienceExpansion::Minimal);
   }
 
   /// True if the type, or the referenced type of an address type, is loadable.
   /// This is the opposite of isAddressOnly.
-  bool isLoadable(SILModule &M) const {
-    return !isAddressOnly(M);
+  bool isLoadable(const SILFunction &F) const {
+    return !isAddressOnly(F);
   }
+
   /// True if either:
   /// 1) The type, or the referenced type of an address type, is loadable.
   /// 2) The SIL Module conventions uses lowered addresses
-  bool isLoadableOrOpaque(SILModule &M) const;
+  bool isLoadableOrOpaque(const SILFunction &F) const;
+
   /// True if the type, or the referenced type of an address type, is
   /// address-only. This is the opposite of isLoadable.
-  bool isAddressOnly(SILModule &M) const;
+  bool isAddressOnly(const SILFunction &F) const;
 
-  /// True if the type, or the referenced type of an address type, is trivial.
-  bool isTrivial(SILModule &M) const;
+  /// True if the type, or the referenced type of an address type, is trivial,
+  /// meaning it is loadable and can be trivially copied, moved or detroyed.
+  bool isTrivial(const SILFunction &F) const;
 
   /// True if the type, or the referenced type of an address type, is known to
-  /// be a scalar reference-counted type. If this is false, then some part of
-  /// the type may be opaque. It may become reference counted later after
-  /// specialization.
+  /// be a scalar reference-counted type.
   bool isReferenceCounted(SILModule &M) const;
 
   /// Returns true if the referenced type is a function type that never
   /// returns.
-  bool isNoReturnFunction() const;
+  bool isNoReturnFunction(SILModule &M) const;
 
   /// Returns true if the referenced type has reference semantics.
   bool hasReferenceSemantics() const {
@@ -325,15 +340,13 @@ public:
   /// representation kind for the type. Returns None if the type is not an
   /// existential type.
   ExistentialRepresentation
-  getPreferredExistentialRepresentation(SILModule &M,
-                                        Type containedType = Type()) const;
+  getPreferredExistentialRepresentation(Type containedType = Type()) const;
   
   /// Returns true if the existential type can use operations for the given
   /// existential representation when working with values of the given type,
   /// or when working with an unknown type if containedType is null.
   bool
-  canUseExistentialRepresentation(SILModule &M,
-                                  ExistentialRepresentation repr,
+  canUseExistentialRepresentation(ExistentialRepresentation repr,
                                   Type containedType = Type()) const;
   
   /// True if the type contains a type parameter.
@@ -365,24 +378,13 @@ public:
   }
   
   /// Returns the ASTContext for the referenced Swift type.
-  const ASTContext &getASTContext() const {
+  ASTContext &getASTContext() const {
     return getASTType()->getASTContext();
   }
 
   /// True if the given type has at least the size and alignment of a native
   /// pointer.
   bool isPointerSizeAndAligned();
-
-  /// Return true if the layout of `toType` is an ABI compatible prefix of
-  /// `fromType` ignoring reference types. `fromType` may be larger than
-  /// `toType` and still be unsafe castable. `fromType` may contain references
-  /// in positions where `toType` does not contain references and still be
-  /// unsafe castable. This is used solely to determine whether an address cast
-  /// can be promoted to a cast between aggregates of scalar values without
-  /// confusing IRGen.
-  static bool canPerformABICompatibleUnsafeCastValue(SILType fromType,
-                                                     SILType toType,
-                                                     SILModule &M);
 
   /// True if `operTy` can be cast by single-reference value into `resultTy`.
   static bool canRefCast(SILType operTy, SILType resultTy, SILModule &M);
@@ -406,11 +408,15 @@ public:
   /// the given field.  Applies substitutions as necessary.  The
   /// result will be an address type if the base type is an address
   /// type or a class.
+  SILType getFieldType(VarDecl *field, Lowering::TypeConverter &TC) const;
+
   SILType getFieldType(VarDecl *field, SILModule &M) const;
 
   /// Given that this is an enum type, return the lowered type of the
   /// data for the given element.  Applies substitutions as necessary.
   /// The result will have the same value category as the base type.
+  SILType getEnumElementType(EnumElementDecl *elt, Lowering::TypeConverter &TC) const;
+
   SILType getEnumElementType(EnumElementDecl *elt, SILModule &M) const;
 
   /// Given that this is a tuple type, return the lowered type of the
@@ -449,36 +455,33 @@ public:
   /// generic args with the appropriate item from the substitution.
   ///
   /// Only call this with function types!
-  SILType substGenericArgs(SILModule &M,
-                           SubstitutionList Subs) const;
+  SILType substGenericArgs(Lowering::TypeConverter &TC,
+                           SubstitutionMap SubMap) const;
 
-  /// Transform the function type SILType by replacing all of its interface
-  /// generic args with the appropriate item from the substitution.
-  ///
-  /// Only call this with function types!
   SILType substGenericArgs(SILModule &M,
-                           const SubstitutionMap &SubMap) const;
+                           SubstitutionMap SubMap) const;
 
   /// If the original type is generic, pass the signature as genericSig.
   ///
   /// If the replacement types are generic, you must push a generic context
   /// first.
-  SILType subst(SILModule &silModule,
-                TypeSubstitutionFn subs,
+  SILType subst(Lowering::TypeConverter &tc, TypeSubstitutionFn subs,
                 LookupConformanceFn conformances,
-                CanGenericSignature genericSig=CanGenericSignature()) const;
+                CanGenericSignature genericSig = CanGenericSignature(),
+                bool shouldSubstituteOpaqueArchetypes = false) const;
 
-  SILType subst(SILModule &silModule, const SubstitutionMap &subs) const;
+  SILType subst(SILModule &M, TypeSubstitutionFn subs,
+                LookupConformanceFn conformances,
+                CanGenericSignature genericSig = CanGenericSignature(),
+                bool shouldSubstituteOpaqueArchetypes = false) const;
+
+  SILType subst(Lowering::TypeConverter &tc, SubstitutionMap subs) const;
+
+  SILType subst(SILModule &M, SubstitutionMap subs) const;
 
   /// Return true if this type references a "ref" type that has a single pointer
   /// representation. Class existentials do not always qualify.
   bool isHeapObjectReferenceType() const;
-
-  /// Return the SILType corresponding to the underlying type of the given
-  /// metatype type.
-  ///
-  /// *NOTE* Only call on SILTypes for metatype types.
-  SILType getMetatypeInstanceType(SILModule& M) const;
 
   /// Returns true if this SILType is an aggregate that contains \p Ty
   bool aggregateContainsRecord(SILType Ty, SILModule &SILMod) const;
@@ -498,10 +501,9 @@ public:
 
   /// Returns true if this is the AnyObject SILType;
   bool isAnyObject() const { return getASTType()->isAnyObject(); }
-
-  /// Returns the underlying referent SILType of an @sil_unowned or @sil_weak
-  /// Type.
-  SILType getReferentType(SILModule &M) const;
+  
+  /// Returns a SILType with any archetypes mapped out of context.
+  SILType mapTypeOutOfContext() const;
 
   /// Given two SIL types which are representations of the same type,
   /// check whether they have an abstraction difference.
@@ -523,14 +525,14 @@ public:
   
   /// Get the NativeObject type as a SILType.
   static SILType getNativeObjectType(const ASTContext &C);
-  /// Get the UnknownObject type as a SILType.
-  static SILType getUnknownObjectType(const ASTContext &C);
   /// Get the BridgeObject type as a SILType.
   static SILType getBridgeObjectType(const ASTContext &C);
   /// Get the RawPointer type as a SILType.
   static SILType getRawPointerType(const ASTContext &C);
   /// Get a builtin integer type as a SILType.
   static SILType getBuiltinIntegerType(unsigned bitWidth, const ASTContext &C);
+  /// Get the IntegerLiteral type as a SILType.
+  static SILType getBuiltinIntegerLiteralType(const ASTContext &C);
   /// Get a builtin floating-point type as a SILType.
   static SILType getBuiltinFloatType(BuiltinFloatType::FPKind Kind,
                                      const ASTContext &C);
@@ -562,7 +564,11 @@ public:
   bool operator!=(SILType rhs) const {
     return value.getOpaqueValue() != rhs.value.getOpaqueValue();
   }
-  
+
+  /// Return the mangled name of this type, ignoring its prefix. Meant for
+  /// diagnostic purposes.
+  std::string getMangledName() const;
+
   std::string getAsString() const;
   void dump() const;
   void print(raw_ostream &OS) const;
@@ -580,9 +586,11 @@ NON_SIL_TYPE(LValue)
 #undef NON_SIL_TYPE
 
 CanSILFunctionType getNativeSILFunctionType(
-    SILModule &M, Lowering::AbstractionPattern origType,
-    CanAnyFunctionType substType, Optional<SILDeclRef> constant = None,
-    Optional<ProtocolConformanceRef> witnessMethodConformance = None);
+    Lowering::TypeConverter &TC, Lowering::AbstractionPattern origType,
+    CanAnyFunctionType substType, Optional<SILDeclRef> origConstant = None,
+    Optional<SILDeclRef> constant = None,
+    Optional<SubstitutionMap> reqtSubs = None,
+    ProtocolConformanceRef witnessMethodConformance = ProtocolConformanceRef());
 
 inline llvm::raw_ostream &operator<<(llvm::raw_ostream &OS, SILType T) {
   T.print(OS);
@@ -598,15 +606,22 @@ static inline llvm::hash_code hash_value(SILType V) {
   return llvm::hash_value(V.getOpaqueValue());
 }
 
-inline SILType SILBoxType::getFieldType(SILModule &M, unsigned index) const {
-  return SILType::getPrimitiveAddressType(getFieldLoweredType(M, index));
-}
-
 inline SILType SILField::getAddressType() const {
   return SILType::getPrimitiveAddressType(getLoweredType());
 }
 inline SILType SILField::getObjectType() const {
   return SILType::getPrimitiveObjectType(getLoweredType());
+}
+
+CanType getSILBoxFieldLoweredType(SILBoxType *type,
+                                  Lowering::TypeConverter &TC,
+                                  unsigned index);
+
+inline SILType getSILBoxFieldType(SILBoxType *type,
+                                  Lowering::TypeConverter &TC,
+                                  unsigned index) {
+  return SILType::getPrimitiveAddressType(
+    getSILBoxFieldLoweredType(type, TC, index));
 }
 
 } // end swift namespace

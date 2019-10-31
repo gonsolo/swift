@@ -21,6 +21,7 @@
 #include "swift/Basic/SourceLoc.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/FoldingSet.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/StringRef.h"
 #include "swift/AST/PrintOptions.h"
 
@@ -290,6 +291,10 @@ class LayoutConstraint {
   /// Return the layout constraint as a string, for use in diagnostics only.
   std::string getString(const PrintOptions &PO = PrintOptions()) const;
 
+  friend llvm::hash_code hash_value(const LayoutConstraint &layout) {
+    return hash_value(layout.getPointer());
+  }
+
   bool operator==(LayoutConstraint rhs) const {
     if (isNull() && rhs.isNull())
       return true;
@@ -342,6 +347,10 @@ public:
 
   bool hasLocation() const { return Loc.isValid(); }
   LayoutConstraint getLayoutConstraint() const { return Layout; }
+
+  void setLayoutConstraint(LayoutConstraint value) {
+    Layout = value;
+  }
 
   bool isNull() const { return Layout.isNull(); }
 

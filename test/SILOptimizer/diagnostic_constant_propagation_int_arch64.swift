@@ -1,4 +1,4 @@
-// RUN: %target-swift-frontend -emit-sil -primary-file %s -o /dev/null -verify
+// RUN: %target-swift-frontend -emit-sil -primary-file %s -o /dev/null -verify -enable-ownership-stripping-after-serialization
 //
 // REQUIRES: PTRSIZE=64
 //
@@ -12,6 +12,8 @@
 // FIXME: <rdar://problem/29937936> False negatives when using integer initializers
 //
 // FIXME: <rdar://problem/39193272> A false negative that happens only in REPL
+
+import StdlibUnittest
 
 func testArithmeticOverflow_Int_64bit() {
   do {
@@ -232,4 +234,9 @@ func testArithmeticOverflow_UInt_64bit() {
     var _ : UInt = (0x7fff_ffff_ffff_ffff) | (0x4000_0000_0000_0000 << 1)
     var _ : UInt = (0x7fff_ffff) | 0x8000_0000_0000_0000
   }
+}
+
+func testIntToFloatConversion() {
+  // No warnings are emitted for conversion through explicit constructor calls.
+  _blackHole(Double(9_007_199_254_740_993))
 }

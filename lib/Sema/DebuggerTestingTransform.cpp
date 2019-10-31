@@ -23,6 +23,7 @@
 #include "swift/AST/Expr.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/ParameterList.h"
+#include "swift/AST/SourceFile.h"
 #include "swift/AST/Stmt.h"
 #include "swift/Subsystems.h"
 
@@ -177,7 +178,9 @@ private:
 
     // Don't capture variables which aren't default-initialized.
     if (auto *VD = dyn_cast<VarDecl>(DstDecl))
-      if (!VD->getParentInitializer() && !VD->isInOut())
+      if (!VD->isParentInitialized() &&
+          !(isa<ParamDecl>(VD) &&
+            cast<ParamDecl>(VD)->isInOut()))
         return {true, OriginalExpr};
 
     // Rewrite the original expression into this:
@@ -215,7 +218,7 @@ private:
     CheckExpectExpr->setThrows(false);
 
     // Create the closure.
-    TypeChecker TC{Ctx};
+    TypeChecker &TC = TypeChecker::createForContext(Ctx);
     auto *Params = ParameterList::createEmpty(Ctx);
     auto *Closure = new (Ctx)
         ClosureExpr(Params, SourceLoc(), SourceLoc(), SourceLoc(), TypeLoc(),
@@ -240,7 +243,7 @@ private:
 
     // Captures have to be computed after the closure is type-checked. This
     // ensures that the type checker can infer <noescape> for captured values.
-    TC.computeCaptures(Closure);
+    TypeChecker::computeCaptures(Closure);
 
     return {false, FinalExpr};
   }

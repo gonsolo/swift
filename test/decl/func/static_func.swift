@@ -29,13 +29,13 @@ struct InMemberFunc {
 }
 
 struct DuplicateStatic {
-  static static func f1() {} // expected-error{{'static' specified twice}}{{10-17=}}
-  static class func f2() {} // expected-error{{'class' specified twice}}{{10-16=}}
-  class static func f3() {} // expected-error{{'static' specified twice}}{{9-16=}} expected-error{{class methods are only allowed within classes; use 'static' to declare a static method}}{{3-8=static}}
-  class class func f4() {} // expected-error{{'class' specified twice}}{{9-15=}} expected-error{{class methods are only allowed within classes; use 'static' to declare a static method}}{{3-8=static}}
-  override static static func f5() {} // expected-error{{'static' specified twice}}{{19-26=}} expected-error{{'override' can only be specified on class members}} {{3-12=}}
-  static override static func f6() {} // expected-error{{'static' specified twice}}{{19-26=}} expected-error{{'override' can only be specified on class members}} {{10-19=}}
-  static static override func f7() {} // expected-error{{'static' specified twice}}{{10-17=}} expected-error{{'override' can only be specified on class members}} {{17-26=}}
+  static static func f1() {} // expected-error{{'static' cannot appear after another 'static' or 'class' keyword}}{{10-17=}}
+  static class func f2() {} // expected-error{{'class' cannot appear after another 'static' or 'class' keyword}}{{10-16=}}
+  class static func f3() {} // expected-error{{'static' cannot appear after another 'static' or 'class' keyword}}{{9-16=}} expected-error{{class methods are only allowed within classes; use 'static' to declare a static method}}{{3-8=static}}
+  class class func f4() {} // expected-error{{'class' cannot appear after another 'static' or 'class' keyword}}{{9-15=}} expected-error{{class methods are only allowed within classes; use 'static' to declare a static method}}{{3-8=static}}
+  override static static func f5() {} // expected-error{{'static' cannot appear after another 'static' or 'class' keyword}}{{19-26=}} expected-error{{'override' can only be specified on class members}} {{3-12=}}
+  static override static func f6() {} // expected-error{{'static' cannot appear after another 'static' or 'class' keyword}}{{19-26=}} expected-error{{'override' can only be specified on class members}} {{10-19=}}
+  static static override func f7() {} // expected-error{{'static' cannot appear after another 'static' or 'class' keyword}}{{10-17=}} expected-error{{'override' can only be specified on class members}} {{17-26=}}
   static final func f8() {} // expected-error {{only classes and class members may be marked with 'final'}}
 }
 
@@ -105,10 +105,15 @@ extension C_Derived {
   class override func ef5() {} // expected-error {{not supported}}
 }
 
-protocol P {
+protocol P { // expected-note{{extended type declared here}}
   static func f1()
   static func f2()
   static func f3() {} // expected-error {{protocol methods must not have bodies}}
   static final func f4() // expected-error {{only classes and class members may be marked with 'final'}}
+  class func f5() // expected-error {{class methods are only allowed within classes; use 'static' to declare a requirement fulfilled by either a static or class method}} {{3-8=static}}
+}
+
+extension P {
+  class func f6() {} // expected-error {{class methods are only allowed within classes; use 'static' to declare a static method}} {{3-8=static}}
 }
 

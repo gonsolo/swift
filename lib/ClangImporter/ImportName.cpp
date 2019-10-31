@@ -25,8 +25,8 @@
 #include "swift/AST/DiagnosticsClangImporter.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/NameLookup.h"
-#include "swift/AST/Types.h"
 #include "swift/AST/TypeRepr.h"
+#include "swift/AST/Types.h"
 #include "swift/Basic/StringExtras.h"
 #include "swift/ClangImporter/ClangImporterOptions.h"
 #include "swift/Parse/Parser.h"
@@ -265,7 +265,7 @@ static OptionalTypeKind getResultOptionality(
   return OTK_ImplicitlyUnwrappedOptional;
 }
 
-/// \brief Determine whether the given name is reserved for Swift.
+/// Determine whether the given name is reserved for Swift.
 static bool isSwiftReservedName(StringRef name) {
   tok kind = Lexer::kindOfIdentifier(name, /*InSILMode=*/false);
   return (kind != tok::identifier);
@@ -552,7 +552,7 @@ namespace {
 /// For a SwiftVersionedRemovalAttr, the Attr member will be null.
 struct VersionedSwiftNameInfo {
   const clang::SwiftNameAttr *Attr;
-  clang::VersionTuple Version;
+  llvm::VersionTuple Version;
   bool IsReplacedByActive;
 };
 
@@ -573,7 +573,7 @@ enum class VersionedSwiftNameAction {
 
 static VersionedSwiftNameAction
 checkVersionedSwiftName(VersionedSwiftNameInfo info,
-                        clang::VersionTuple bestSoFar,
+                        llvm::VersionTuple bestSoFar,
                         ImportNameVersion requestedVersion) {
   if (!bestSoFar.empty() && bestSoFar <= info.Version)
     return VersionedSwiftNameAction::Ignore;
@@ -616,9 +616,15 @@ findSwiftNameAttr(const clang::Decl *decl, ImportNameVersion version) {
 
   // Handle versioned API notes for Swift 3 and later. This is the common case.
   if (version > ImportNameVersion::swift2()) {
+    // FIXME: Until Apple gets a chance to update UIKit's API notes, always use
+    // the new name for certain properties.
+    if (auto *namedDecl = dyn_cast<clang::NamedDecl>(decl))
+      if (importer::isSpecialUIKitStructZeroProperty(namedDecl))
+        version = ImportNameVersion::swift4_2();
+
     const auto *activeAttr = decl->getAttr<clang::SwiftNameAttr>();
     const clang::SwiftNameAttr *result = activeAttr;
-    clang::VersionTuple bestSoFar;
+    llvm::VersionTuple bestSoFar;
     for (auto *attr : decl->attrs()) {
       VersionedSwiftNameInfo info;
 
@@ -676,9 +682,9 @@ findSwiftNameAttr(const clang::Decl *decl, ImportNameVersion version) {
   auto attr = decl->getAttr<clang::SwiftNameAttr>();
   if (!attr) return nullptr;
 
-  // API notes produce implicit attributes; ignore them because they weren't
-  // used for naming in Swift 2.
-  if (attr->isImplicit()) return nullptr;
+  // API notes produce attributes with no source location; ignore them because
+  // they weren't used for naming in Swift 2.
+  if (attr->getLocation().isInvalid()) return nullptr;
 
   // Hardcode certain kinds of explicitly-written Swift names that were
   // permitted and used in Swift 2. All others are ignored, so that we are
@@ -734,9 +740,7 @@ getFactoryAsInit(const clang::ObjCInterfaceDecl *classDecl,
 /// should be stripped from the first selector piece, e.g., "init"
 /// or the restated name of the class in a factory method.
 ///
-///  \param kind Will be set to the kind of initializer being
-///  imported. Note that this does not distinguish designated
-///  vs. convenience; both will be classified as "designated".
+/// \param kind Will be set to the kind of initializer being imported.
 static bool shouldImportAsInitializer(const clang::ObjCMethodDecl *method,
                                       ImportNameVersion version,
                                       unsigned &prefixLength,
@@ -744,7 +748,17 @@ static bool shouldImportAsInitializer(const clang::ObjCMethodDecl *method,
   /// Is this an initializer?
   if (isInitMethod(method)) {
     prefixLength = 4;
-    kind = CtorInitializerKind::Designated;
+
+    // If the owning Objective-C class has designated initializers and this
+    // is not one of them, treat it as a convenience initializer.
+    const clang::ObjCInterfaceDecl *interface = method->getClassInterface();
+    if (interface && interface->hasDesignatedInitializers() &&
+        !method->hasAttr<clang::ObjCDesignatedInitializerAttr>()) {
+      kind = CtorInitializerKind::Convenience;
+    } else {
+      kind = CtorInitializerKind::Designated;
+    }
+
     return true;
   }
 
@@ -791,7 +805,7 @@ static bool shouldImportAsInitializer(const clang::ObjCMethodDecl *method,
 static bool omitNeedlessWordsInFunctionName(
     StringRef &baseName, SmallVectorImpl<StringRef> &argumentNames,
     ArrayRef<const clang::ParmVarDecl *> params, clang::QualType resultType,
-    const clang::DeclContext *dc, const llvm::SmallBitVector &nonNullArgs,
+    const clang::DeclContext *dc, const SmallBitVector &nonNullArgs,
     Optional<unsigned> errorParamIndex, bool returnsSelf, bool isInstanceMethod,
     NameImporter &nameImporter) {
   clang::ASTContext &clangCtx = nameImporter.getClangContext();
@@ -827,8 +841,8 @@ static bool omitNeedlessWordsInFunctionName(
             param->getType(),
             getParamOptionality(swiftLanguageVersion, param,
                                 !nonNullArgs.empty() && nonNullArgs[i]),
-            nameImporter.getIdentifier(baseName), numParams, argumentName,
-            i == 0, isLastParameter, nameImporter) != DefaultArgumentKind::None;
+            nameImporter.getIdentifier(baseName), argumentName, i == 0,
+            isLastParameter, nameImporter) != DefaultArgumentKind::None;
 
     paramTypes.push_back(getClangTypeNameForOmission(clangCtx,
                                                      param->getOriginalType())
@@ -1398,8 +1412,8 @@ ImportedName NameImporter::importNameImpl(const clang::NamedDecl *D,
   case clang::DeclarationName::CXXOperatorName:
   case clang::DeclarationName::CXXUsingDirective:
   case clang::DeclarationName::CXXDeductionGuideName:
-    // Handling these is part of C++ interoperability.
-    llvm_unreachable("unhandled C++ interoperability");
+    // TODO: Handling these is part of C++ interoperability.
+    return ImportedName();
 
   case clang::DeclarationName::Identifier:
     // Map the identifier.
@@ -1722,10 +1736,16 @@ ImportedName NameImporter::importNameImpl(const clang::NamedDecl *D,
 }
 
 /// Returns true if it is expected that the macro is ignored.
-static bool shouldIgnoreMacro(StringRef name, const clang::MacroInfo *macro) {
-  // Ignore include guards.
-  if (macro->isUsedForHeaderGuard())
-    return true;
+static bool shouldIgnoreMacro(StringRef name, const clang::MacroInfo *macro,
+                              clang::Preprocessor &PP) {
+  // Ignore include guards. Try not to ignore definitions of useful constants,
+  // which may end up looking like include guards.
+  if (macro->isUsedForHeaderGuard() && macro->getNumTokens() == 1) {
+    auto tok = macro->tokens()[0];
+    if (tok.is(clang::tok::numeric_constant) && tok.getLength() == 1 &&
+        PP.getSpellingOfSingleCharacterNumericConstant(tok) == '1')
+      return true;
+  }
 
   // If there are no tokens, there is nothing to convert.
   if (macro->tokens_empty())
@@ -1749,14 +1769,15 @@ static bool shouldIgnoreMacro(StringRef name, const clang::MacroInfo *macro) {
 
 bool ClangImporter::shouldIgnoreMacro(StringRef Name,
                                       const clang::MacroInfo *Macro) {
-  return ::shouldIgnoreMacro(Name, Macro);
+  return ::shouldIgnoreMacro(Name, Macro, Impl.getClangPreprocessor());
 }
 
 Identifier
 NameImporter::importMacroName(const clang::IdentifierInfo *clangIdentifier,
                               const clang::MacroInfo *macro) {
   // If we're supposed to ignore this macro, return an empty identifier.
-  if (::shouldIgnoreMacro(clangIdentifier->getName(), macro))
+  if (::shouldIgnoreMacro(clangIdentifier->getName(), macro,
+                          getClangPreprocessor()))
     return Identifier();
 
   // No transformation is applied to the name.
@@ -1768,15 +1789,51 @@ ImportedName NameImporter::importName(const clang::NamedDecl *decl,
                                       ImportNameVersion version,
                                       clang::DeclarationName givenName) {
   CacheKeyType key(decl, version);
-  if (importNameCache.count(key) && !givenName) {
-    ++ImportNameNumCacheHits;
-    return importNameCache[key];
+  if (!givenName) {
+    if (auto cachedRes = importNameCache[key]) {
+      ++ImportNameNumCacheHits;
+      return cachedRes;
+    }
   }
   ++ImportNameNumCacheMisses;
   auto res = importNameImpl(decl, version, givenName);
   if (!givenName)
     importNameCache[key] = res;
   return res;
+}
+
+bool NameImporter::forEachDistinctImportName(
+    const clang::NamedDecl *decl, ImportNameVersion activeVersion,
+    llvm::function_ref<bool(ImportedName, ImportNameVersion)> action) {
+  using ImportNameKey = std::pair<DeclName, EffectiveClangContext>;
+  SmallVector<ImportNameKey, 8> seenNames;
+
+  ImportedName newName = importName(decl, activeVersion);
+  if (!newName)
+    return true;
+  ImportNameKey key(newName.getDeclName(), newName.getEffectiveContext());
+  if (action(newName, activeVersion))
+    seenNames.push_back(key);
+
+  activeVersion.forEachOtherImportNameVersion(
+      [&](ImportNameVersion nameVersion) {
+        // Check to see if the name is different.
+        ImportedName newName = importName(decl, nameVersion);
+        if (!newName)
+          return;
+        ImportNameKey key(newName.getDeclName(), newName.getEffectiveContext());
+
+        bool seen = llvm::any_of(
+            seenNames, [&key](const ImportNameKey &existing) -> bool {
+              return key.first == existing.first &&
+                     key.second.equalsWithoutResolving(existing.second);
+            });
+        if (seen)
+          return;
+        if (action(newName, nameVersion))
+          seenNames.push_back(key);
+      });
+  return false;
 }
 
 const InheritedNameSet *NameImporter::getAllPropertyNames(
@@ -1795,10 +1852,10 @@ const InheritedNameSet *NameImporter::getAllPropertyNames(
   }
 
   // Create the set of properties.
-  known = allProperties.insert(
-            { std::pair<const clang::ObjCInterfaceDecl *, char>(classDecl,
-                                                                forInstance),
-              llvm::make_unique<InheritedNameSet>(parentSet) }).first;
+  llvm::BumpPtrAllocator &alloc = scratch.getAllocator();
+  known = allProperties.insert({
+      std::pair<const clang::ObjCInterfaceDecl *, char>(classDecl, forInstance),
+      llvm::make_unique<InheritedNameSet>(parentSet, alloc) }).first;
 
   // Local function to add properties from the given set.
   auto addProperties = [&](clang::DeclContext::decl_range members) {
@@ -1846,4 +1903,3 @@ const InheritedNameSet *NameImporter::getAllPropertyNames(
 
   return known->second.get();
 }
-

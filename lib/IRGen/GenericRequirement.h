@@ -62,7 +62,7 @@ emitGenericRequirementFromSubstitutions(IRGenFunction &IGF,
                                         CanGenericSignature signature,
                                         ModuleDecl &module,
                                         GenericRequirement requirement,
-                                        const SubstitutionMap &subs);
+                                        SubstitutionMap subs);
 
 using EmitGenericRequirementFn =
   llvm::function_ref<llvm::Value*(GenericRequirement reqt)>;
@@ -137,14 +137,12 @@ public:
 
   bool empty() const { return Requirements.empty(); }
 
-  using FulfillmentCallback =
-    llvm::function_ref<void(unsigned requirementIndex,
-                            CanType type,
-                            Optional<ProtocolConformanceRef> conf)>;
-  void enumerateFulfillments(IRGenModule &IGM, const SubstitutionMap &subs,
+  using FulfillmentCallback = llvm::function_ref<void(
+      unsigned requirementIndex, CanType type, ProtocolConformanceRef conf)>;
+  void enumerateFulfillments(IRGenModule &IGM, SubstitutionMap subs,
                              FulfillmentCallback callback);
 
-  void emitInitOfBuffer(IRGenFunction &IGF, const SubstitutionMap &subs,
+  void emitInitOfBuffer(IRGenFunction &IGF, SubstitutionMap subs,
                         Address buffer);
 
   void bindFromBuffer(IRGenFunction &IGF, Address buffer, MetadataState state,

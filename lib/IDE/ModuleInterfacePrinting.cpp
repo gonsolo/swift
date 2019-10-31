@@ -14,16 +14,17 @@
 #include "swift/IDE/Utils.h"
 #include "swift/Sema/IDETypeChecking.h"
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/ASTDemangler.h"
 #include "swift/AST/ASTPrinter.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/PrintOptions.h"
+#include "swift/AST/SourceFile.h"
 #include "swift/Basic/PrimitiveParsing.h"
 #include "swift/ClangImporter/ClangImporter.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/Parse/Token.h"
-#include "swift/Serialization/ModuleFile.h"
 #include "swift/Subsystems.h"
 #include "swift/Serialization/SerializedModuleLoader.h"
 #include "clang/AST/ASTContext.h"
@@ -74,8 +75,9 @@ private:
   void printTypePost(const TypeLoc &TL) override {
     return OtherPrinter.printTypePost(TL);
   }
-  void printTypeRef(Type T, const TypeDecl *TD, Identifier Name) override {
-    return OtherPrinter.printTypeRef(T, TD, Name);
+  void printTypeRef(Type T, const TypeDecl *TD, Identifier Name,
+                    PrintNameContext NameContext) override {
+    return OtherPrinter.printTypeRef(T, TD, Name, NameContext);
   }
   void printModuleRef(ModuleEntity Mod, Identifier Name) override {
     return OtherPrinter.printModuleRef(Mod, Name);
@@ -182,8 +184,8 @@ printTypeInterface(ModuleDecl *M, Type Ty, ASTPrinter &Printer,
 bool swift::ide::
 printTypeInterface(ModuleDecl *M, StringRef TypeUSR, ASTPrinter &Printer,
                    std::string &TypeName, std::string &Error) {
-  return printTypeInterface(M, getTypeFromMangledSymbolname(M->getASTContext(),
-                                                            TypeUSR, Error),
+  return printTypeInterface(M, Demangle::getTypeForMangling(M->getASTContext(),
+                                                            TypeUSR),
                             Printer, TypeName, Error);
 }
 
@@ -207,8 +209,6 @@ static void adjustPrintOptions(PrintOptions &AdjustedOptions) {
   // Print var declarations separately, one variable per decl.
   AdjustedOptions.ExplodePatternBindingDecls = true;
   AdjustedOptions.VarInitializers = false;
-
-  AdjustedOptions.PrintDefaultParameterPlaceholder = true;
 }
 
 ArrayRef<StringRef>
@@ -222,49 +222,10 @@ swift::ide::collectModuleGroups(ModuleDecl *M, std::vector<StringRef> &Scratch) 
   return llvm::makeArrayRef(Scratch);
 }
 
-/// Retrieve the effective Clang node for the given declaration, which
-/// copes with the odd case of imported Error enums.
-static ClangNode getEffectiveClangNode(const Decl *decl) {
-  // Directly...
-  if (auto clangNode = decl->getClangNode())
-    return clangNode;
-
-  // Or via the nested "Code" enum.
-  if (auto nominal =
-        const_cast<NominalTypeDecl *>(dyn_cast<NominalTypeDecl>(decl))) {
-    auto &ctx = nominal->getASTContext();
-    for (auto code : nominal->lookupDirect(ctx.Id_Code,
-                                           /*ignoreNewExtensions=*/true)) {
-      if (auto clangDecl = code->getClangDecl())
-        return clangDecl;
-    }
-  }
-
-  return ClangNode();
-}
-
-/// Retrieve the Clang node for the given extension, if it has one.
-static ClangNode extensionGetClangNode(ExtensionDecl *ext) {
-  // If it has a Clang node (directly), 
-  if (ext->hasClangNode()) return ext->getClangNode();
-
-  // Check whether it was syntheszed into a module-scope context.
-  if (!isa<ClangModuleUnit>(ext->getModuleScopeContext()))
-    return ClangNode();
-
-  // It may have a global imported as a member.
-  for (auto member : ext->getMembers()) {
-    if (auto clangNode = getEffectiveClangNode(member))
-      return clangNode;
-  }
-
-  return ClangNode();
-}
-
 /// Determine whether the given extension has a Clang node that
 /// created it (vs. being a Swift extension).
 static bool extensionHasClangNode(ExtensionDecl *ext) {
-  return static_cast<bool>(extensionGetClangNode(ext));
+  return static_cast<bool>(swift::ide::extensionGetClangNode(ext));
 }
 
 Optional<StringRef>
@@ -365,7 +326,6 @@ void swift::ide::printSubmoduleInterface(
     // Skip declarations that are not accessible.
     if (auto *VD = dyn_cast<ValueDecl>(D)) {
       if (Options.AccessFilter > AccessLevel::Private &&
-          VD->hasAccess() &&
           VD->getFormalAccess() < Options.AccessFilter)
         continue;
     }
@@ -497,7 +457,7 @@ void swift::ide::printSubmoduleInterface(
   // If the group name is specified, we sort them according to their source order,
   // which is the order preserved by getTopLevelDecls.
   if (GroupNames.empty()) {
-    std::sort(SwiftDecls.begin(), SwiftDecls.end(),
+    std::stable_sort(SwiftDecls.begin(), SwiftDecls.end(),
       [&](Decl *LHS, Decl *RHS) -> bool {
         auto *LHSValue = dyn_cast<ValueDecl>(LHS);
         auto *RHSValue = dyn_cast<ValueDecl>(RHS);
@@ -533,7 +493,7 @@ void swift::ide::printSubmoduleInterface(
       // Swift extensions are printed with their associated type unless it's
       // a cross-module extension.
       if (!extensionHasClangNode(Ext)) {
-        auto ExtendedNominal = Ext->getExtendedType()->getAnyNominal();
+        auto ExtendedNominal = Ext->getExtendedNominal();
         if (Ext->getModuleContext() == ExtendedNominal->getModuleContext())
           return false;
       }
@@ -824,7 +784,7 @@ void ClangCommentPrinter::printDeclPre(const Decl *D,
   // single line.
   // FIXME: we should fix that, since it also affects struct members, etc.
   if (!isa<ParamDecl>(D)) {
-    if (auto ClangN = getEffectiveClangNode(D)) {
+    if (auto ClangN = swift::ide::getEffectiveClangNode(D)) {
       printCommentsUntil(ClangN);
       if (shouldPrintNewLineBefore(ClangN)) {
         *this << "\n";
@@ -848,7 +808,7 @@ void ClangCommentPrinter::printDeclPost(const Decl *D,
     *this << " " << ASTPrinter::sanitizeUtf8(CommentText);
   }
   PendingComments.clear();
-  if (auto ClangN = getEffectiveClangNode(D))
+  if (auto ClangN = swift::ide::getEffectiveClangNode(D))
     updateLastEntityLine(ClangN.getSourceRange().getEnd());
 }
 

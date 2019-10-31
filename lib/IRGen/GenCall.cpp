@@ -182,17 +182,22 @@ void IRGenModule::addSwiftSelfAttributes(llvm::AttributeList &attrs,
 
 void IRGenModule::addSwiftErrorAttributes(llvm::AttributeList &attrs,
                                           unsigned argIndex) {
-  // Don't add the swifterror attribute on ABI that don't pass it in a register.
+  llvm::AttrBuilder b;
+  // Don't add the swifterror attribute on ABIs that don't pass it in a register.
   // We create a shadow stack location of the swifterror parameter for the
   // debugger on such platforms and so we can't mark the parameter with a
   // swifterror attribute.
-  if (!this->IsSwiftErrorInRegister)
-    return;
-
-  llvm::AttrBuilder b;
-  b.addAttribute(llvm::Attribute::SwiftError);
-  attrs = attrs.addAttributes(this->LLVMContext,
-                              argIndex + llvm::AttributeList::FirstArgIndex, b);
+  if (IsSwiftErrorInRegister)
+    b.addAttribute(llvm::Attribute::SwiftError);
+  
+  // The error result should not be aliased, captured, or pointed at invalid
+  // addresses regardless.
+  b.addAttribute(llvm::Attribute::NoAlias);
+  b.addAttribute(llvm::Attribute::NoCapture);
+  b.addDereferenceableAttr(getPointerSize().getValue());
+  
+  auto attrIndex = argIndex + llvm::AttributeList::FirstArgIndex;
+  attrs = attrs.addAttributes(this->LLVMContext, attrIndex, b);
 }
 
 void irgen::addByvalArgumentAttributes(IRGenModule &IGM,
@@ -850,7 +855,34 @@ namespace {
       case clang::BuiltinType::OCLClkEvent:
       case clang::BuiltinType::OCLQueue:
       case clang::BuiltinType::OCLReserveID:
+      case clang::BuiltinType::OCLIntelSubgroupAVCMcePayload:
+      case clang::BuiltinType::OCLIntelSubgroupAVCImePayload:
+      case clang::BuiltinType::OCLIntelSubgroupAVCRefPayload:
+      case clang::BuiltinType::OCLIntelSubgroupAVCSicPayload:
+      case clang::BuiltinType::OCLIntelSubgroupAVCMceResult:
+      case clang::BuiltinType::OCLIntelSubgroupAVCImeResult:
+      case clang::BuiltinType::OCLIntelSubgroupAVCRefResult:
+      case clang::BuiltinType::OCLIntelSubgroupAVCSicResult:
+      case clang::BuiltinType::OCLIntelSubgroupAVCImeResultSingleRefStreamout:
+      case clang::BuiltinType::OCLIntelSubgroupAVCImeResultDualRefStreamout:
+      case clang::BuiltinType::OCLIntelSubgroupAVCImeSingleRefStreamin:
+      case clang::BuiltinType::OCLIntelSubgroupAVCImeDualRefStreamin:
         llvm_unreachable("OpenCL type in ABI lowering");
+
+      // We should never see the SVE types at all.
+      case clang::BuiltinType::SveInt8:
+      case clang::BuiltinType::SveInt16:
+      case clang::BuiltinType::SveInt32:
+      case clang::BuiltinType::SveInt64:
+      case clang::BuiltinType::SveUint8:
+      case clang::BuiltinType::SveUint16:
+      case clang::BuiltinType::SveUint32:
+      case clang::BuiltinType::SveUint64:
+      case clang::BuiltinType::SveFloat16:
+      case clang::BuiltinType::SveFloat32:
+      case clang::BuiltinType::SveFloat64:
+      case clang::BuiltinType::SveBool:
+        llvm_unreachable("SVE type in ABI lowering");
 
       // Handle all the integer types as opaque values.
 #define BUILTIN_TYPE(Id, SingletonId)
@@ -1034,7 +1066,8 @@ void SignatureExpansion::expandExternalSignatureTypes() {
   assert(FnType->getLanguage() == SILFunctionLanguage::C);
 
   // Convert the SIL result type to a Clang type.
-  auto clangResultTy = IGM.getClangType(FnType->getFormalCSemanticResult());
+  auto clangResultTy =
+    IGM.getClangType(FnType->getFormalCSemanticResult(IGM.getSILModule()));
 
   // Now convert the parameters to Clang types.
   auto params = FnType->getParameters();
@@ -1047,7 +1080,7 @@ void SignatureExpansion::expandExternalSignatureTypes() {
     // ObjC methods take their 'self' argument first, followed by an
     // implicit _cmd argument.
     auto &self = params.back();
-    auto clangTy = IGM.getClangType(self);
+    auto clangTy = IGM.getClangType(self, FnType);
     paramTys.push_back(clangTy);
     paramTys.push_back(clangCtx.VoidPtrTy);
     params = params.drop_back();
@@ -1078,7 +1111,7 @@ void SignatureExpansion::expandExternalSignatureTypes() {
 
   // Convert each parameter to a Clang type.
   for (auto param : params) {
-    auto clangTy = IGM.getClangType(param);
+    auto clangTy = IGM.getClangType(param, FnType);
     paramTys.push_back(clangTy);
   }
 
@@ -1278,7 +1311,7 @@ bool irgen::hasSelfContextParameter(CanSILFunctionType fnType) {
   }
 
   // Direct conventions depend on the type.
-  CanType type = param.getType();
+  CanType type = param.getInterfaceType();
 
   // Thick or @objc metatypes (but not existential metatypes).
   if (auto metatype = dyn_cast<MetatypeType>(type)) {
@@ -1439,7 +1472,7 @@ Signature SignatureExpansion::getSignature() {
 
 Signature Signature::getUncached(IRGenModule &IGM,
                                  CanSILFunctionType formalType) {
-  GenericContextScope scope(IGM, formalType->getGenericSignature());
+  GenericContextScope scope(IGM, formalType->getInvocationGenericSignature());
   SignatureExpansion expansion(IGM, formalType);
   expansion.expandFunctionType();
   return expansion.getSignature();
@@ -1497,6 +1530,17 @@ void CallEmission::emitToUnmappedExplosion(Explosion &out) {
     result = emitObjCRetainAutoreleasedReturnValue(IGF, result);
   }
 
+  auto origFnType = getCallee().getOrigFunctionType();
+
+  // Specially handle noreturn c function which would return a 'Never' SIL result
+  // type.
+  if (origFnType->getLanguage() == SILFunctionLanguage::C &&
+      origFnType->isNoReturnFunction(IGF.getSILModule())) {
+    auto clangResultTy = result->getType();
+    extractScalarResults(IGF, clangResultTy, result, out);
+    return;
+  }
+
   // Get the natural IR type in the body of the function that makes
   // the call. This may be different than the IR type returned by the
   // call itself due to ABI type coercion.
@@ -1505,11 +1549,11 @@ void CallEmission::emitToUnmappedExplosion(Explosion &out) {
 
   // For ABI reasons the result type of the call might not actually match the
   // expected result type.
+  //
+  // This can happen when calling C functions, or class method dispatch thunks
+  // for methods that have covariant ABI-compatible overrides.
   auto expectedNativeResultType = nativeSchema.getExpandedType(IGF.IGM);
   if (result->getType() != expectedNativeResultType) {
-    // This should only be needed when we call C functions.
-    assert(getCallee().getOrigFunctionType()->getLanguage() ==
-           SILFunctionLanguage::C);
     result =
         IGF.coerceValue(result, expectedNativeResultType, IGF.IGM.DataLayout);
   }
@@ -1579,7 +1623,7 @@ llvm::CallSite CallEmission::emitCallSite() {
                                       { opaqueCallee });
     opaqueCallee =
       IGF.Builder.CreateBitCast(opaqueCallee, origCallee->getType());
-    call->setCalledFunction(opaqueCallee);
+    call->setCalledFunction(fn.getFunctionType(), opaqueCallee);
 
     // Reset the insert point to after the call.
     IGF.Builder.SetInsertPoint(call->getParent());
@@ -1637,8 +1681,10 @@ void CallEmission::emitToMemory(Address addr,
   // result that's actually being passed indirectly.
   //
   // TODO: SIL address lowering should be able to handle such cases earlier.
-  auto origResultType = origFnType->getDirectFormalResultsType().getASTType();
-  auto substResultType = substFnType->getDirectFormalResultsType().getASTType();
+  auto origResultType = origFnType->getDirectFormalResultsType(IGF.IGM.getSILModule())
+                                  .getASTType();
+  auto substResultType = substFnType->getDirectFormalResultsType(IGF.IGM.getSILModule())
+                                    .getASTType();
 
   if (origResultType->hasTypeParameter())
     origResultType = IGF.IGM.getGenericEnvironment()
@@ -1733,9 +1779,11 @@ void CallEmission::emitYieldsToExplosion(Explosion &out) {
     }
 
     // Otherwise, it's direct.  Remap.
-    auto temp = schema.getDirectSchema().mapFromNative(IGF.IGM, IGF,
-                                                       rawYieldComponents,
-                                                       schema.getSILType());
+    const auto &directSchema = schema.getDirectSchema();
+    Explosion eltValues;
+    rawYieldComponents.transferInto(eltValues, directSchema.size());
+    auto temp = directSchema.mapFromNative(IGF.IGM, IGF, eltValues,
+                                           schema.getSILType());
 
     auto &yieldTI = cast<LoadableTypeInfo>(schema.getTypeInfo());
     emitCastToSubstSchema(IGF, temp, yieldTI.getSchema(), out);
@@ -1761,9 +1809,23 @@ void CallEmission::emitToExplosion(Explosion &out, bool isOutlined) {
   auto &substResultTI =
     cast<LoadableTypeInfo>(IGF.getTypeInfo(substResultType));
 
+  auto origFnType = getCallee().getOrigFunctionType();
+  auto isNoReturnCFunction =
+      origFnType->getLanguage() == SILFunctionLanguage::C &&
+      origFnType->isNoReturnFunction(IGF.getSILModule());
+
   // If the call is naturally to memory, emit it that way and then
   // explode that temporary.
   if (LastArgWritten == 1) {
+    if (isNoReturnCFunction) {
+      auto fnType = getCallee().getFunctionPointer().getFunctionType();
+      assert(fnType->getNumParams() > 0);
+      auto resultTy = fnType->getParamType(0)->getPointerElementType();
+      auto temp = IGF.createAlloca(resultTy, Alignment(0), "indirect.result");
+      emitToMemory(temp, substResultTI, isOutlined);
+      return;
+    }
+
     StackAddress ctemp = substResultTI.allocateStack(IGF, substResultType,
                                                      "call.aggresult");
     Address temp = ctemp.getAddress();
@@ -1779,6 +1841,13 @@ void CallEmission::emitToExplosion(Explosion &out, bool isOutlined) {
   // Okay, we're naturally emitting to an explosion.
   Explosion temp;
   emitToUnmappedExplosion(temp);
+
+  // Specially handle noreturn c function which would return a 'Never' SIL result
+  // type: there is no need to cast the result.
+  if (isNoReturnCFunction) {
+    temp.transferInto(out, temp.size());
+    return;
+  }
 
   // We might need to bitcast the results.
   emitCastToSubstSchema(IGF, temp, substResultTI.getSchema(), out);
@@ -1818,7 +1887,8 @@ Callee::Callee(CalleeInfo &&info, const FunctionPointer &fn,
     break;
   case SILFunctionTypeRepresentation::Method:
   case SILFunctionTypeRepresentation::WitnessMethod:
-    assert((FirstData != nullptr) == hasSelfContextParameter(Info.OrigFnType));
+    assert((FirstData != nullptr) ==
+           hasSelfContextParameter(Info.OrigFnType));
     assert(!SecondData);
     break;
   case SILFunctionTypeRepresentation::Thick:
@@ -2209,8 +2279,8 @@ static void externalizeArguments(IRGenFunction &IGF, const Callee &callee,
                                  Explosion &in, Explosion &out,
                                  TemporarySet &temporaries,
                                  bool isOutlined) {
-  auto silConv = IGF.IGM.silConv;
   auto fnType = callee.getOrigFunctionType();
+  auto silConv = SILFunctionConventions(fnType, IGF.IGM.silConv);
   auto params = fnType->getParameters();
 
   assert(callee.getForeignInfo().ClangInfo);
@@ -2318,7 +2388,9 @@ static void externalizeArguments(IRGenFunction &IGF, const Callee &callee,
 }
 
 /// Returns whether allocas are needed.
-bool irgen::addNativeArgument(IRGenFunction &IGF, Explosion &in,
+bool irgen::addNativeArgument(IRGenFunction &IGF,
+                              Explosion &in,
+                              CanSILFunctionType fnTy,
                               SILParameterInfo origParamInfo, Explosion &out,
                               bool isOutlined) {
   // Addresses consist of a single pointer argument.
@@ -2326,7 +2398,7 @@ bool irgen::addNativeArgument(IRGenFunction &IGF, Explosion &in,
     out.add(in.claimNext());
     return false;
   }
-  auto paramType = IGF.IGM.silConv.getSILType(origParamInfo);
+  auto paramType = IGF.IGM.silConv.getSILType(origParamInfo, fnTy);
   auto &ti = cast<LoadableTypeInfo>(IGF.getTypeInfo(paramType));
   auto schema = ti.getSchema();
   auto &nativeSchema = ti.nativeParameterValueSchema(IGF.IGM);
@@ -2580,7 +2652,8 @@ llvm::Value *irgen::emitYield(IRGenFunction &IGF,
   // Translate the arguments to an unsubstituted form.
   Explosion allComponents;
   for (auto yield : coroutineType->getYields())
-    addNativeArgument(IGF, substValues, yield, allComponents, false);
+    addNativeArgument(IGF, substValues, coroutineType,
+                      yield, allComponents, false);
 
   // Figure out which arguments need to be yielded directly.
   SmallVector<llvm::Value*, 8> yieldArgs;
@@ -2713,7 +2786,8 @@ void CallEmission::setArgs(Explosion &original, bool isOutlined,
       params = params.drop_back();
     }
     for (auto param : params) {
-      addNativeArgument(IGF, original, param, adjusted, isOutlined);
+      addNativeArgument(IGF, original,
+                        origCalleeType, param, adjusted, isOutlined);
     }
 
     // Anything else, just pass along.  This will include things like
@@ -2758,7 +2832,7 @@ Address IRGenFunction::getErrorResultSlot(SILType errorType) {
   if (!ErrorResultSlot) {
     auto &errorTI = cast<FixedTypeInfo>(getTypeInfo(errorType));
 
-    IRBuilder builder(IGM.getLLVMContext(), IGM.DebugInfo);
+    IRBuilder builder(IGM.getLLVMContext(), IGM.DebugInfo != nullptr);
     builder.SetInsertPoint(AllocaIP->getParent(), AllocaIP->getIterator());
 
     // Create the alloca.  We don't use allocateStack because we're
@@ -3100,7 +3174,6 @@ Explosion NativeConventionSchema::mapFromNative(IRGenModule &IGM,
   // Store the expanded type elements.
   auto coercionAddr = Builder.CreateElementBitCast(temporary, coercionTy);
   unsigned expandedMapIdx = 0;
-  SmallVector<llvm::Value *, 8> expandedElts(expandedTys.size(), nullptr);
 
   auto eltsArray = native.claimAll();
   SmallVector<llvm::Value *, 8> nativeElts(eltsArray.begin(), eltsArray.end());

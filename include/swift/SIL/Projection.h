@@ -22,11 +22,12 @@
 #ifndef SWIFT_SIL_PROJECTION_H
 #define SWIFT_SIL_PROJECTION_H
 
+#include "swift/AST/TypeAlignments.h"
 #include "swift/Basic/NullablePtr.h"
 #include "swift/Basic/PointerIntEnum.h"
-#include "swift/AST/TypeAlignments.h"
-#include "swift/SIL/SILValue.h"
+#include "swift/Basic/STLExtras.h"
 #include "swift/SIL/SILInstruction.h"
+#include "swift/SIL/SILValue.h"
 #include "swift/SILOptimizer/Analysis/ARCAnalysis.h"
 #include "swift/SILOptimizer/Analysis/RCIdentityAnalysis.h"
 #include "llvm/ADT/Hashing.h"
@@ -78,7 +79,7 @@ bool getIntegerIndex(SILValue IndexVal, unsigned &IndexConst);
 /// TypeAlignments.h.
 ///
 /// Projection Kinds which can be represented via indices can use as many bits
-/// as they want to represent the kind. When the index value is uses at most 11
+/// as they want to represent the kind. When the index value uses at most 11
 /// bits, we represent it inline in the data structure. This is taking advantage
 /// of the fact that on most modern OSes (including Darwin), the zero page is
 /// not allocated. In the case where we have more than 11 bits of value
@@ -289,30 +290,10 @@ public:
 
   /// Apply this projection to \p BaseType and return the relevant subfield's
   /// SILType if BaseField has less subtypes than projection's offset.
-  SILType getType(SILType BaseType, SILModule &M) const {
-    assert(isValid());
-    switch (getKind()) {
-    case ProjectionKind::Struct:
-    case ProjectionKind::Class:
-      return BaseType.getFieldType(getVarDecl(BaseType), M);
-    case ProjectionKind::Enum:
-      return BaseType.getEnumElementType(getEnumElementDecl(BaseType), M);
-    case ProjectionKind::Box:
-      return BaseType.castTo<SILBoxType>()->getFieldType(M, getIndex());
-    case ProjectionKind::Tuple:
-      return BaseType.getTupleElementType(getIndex());
-    case ProjectionKind::Upcast:
-    case ProjectionKind::RefCast:
-    case ProjectionKind::BitwiseCast:
-    case ProjectionKind::TailElems:
-      return getCastType(BaseType);
-    case ProjectionKind::Index:
-      // Index types do not change the underlying type.
-      return BaseType;
-    }
-
-    llvm_unreachable("Unhandled ProjectionKind in switch.");
-  }
+  ///
+  /// WARNING: This is not a constant time operation because it is implemented
+  /// in terms of getVarDecl, which requests all BaseType's stored properties.
+  SILType getType(SILType BaseType, SILModule &M) const;
 
   VarDecl *getVarDecl(SILType BaseType) const {
     assert(isValid());
@@ -321,9 +302,7 @@ public:
     assert(BaseType.getNominalOrBoundGenericNominal() &&
            "This should only be called with a nominal type");
     auto *NDecl = BaseType.getNominalOrBoundGenericNominal();
-    auto Iter = NDecl->getStoredProperties().begin();
-    std::advance(Iter, getIndex());
-    return *Iter;
+    return NDecl->getStoredProperties()[getIndex()];
   }
 
   EnumElementDecl *getEnumElementDecl(SILType BaseType) const {
@@ -372,15 +351,15 @@ public:
 
   /// Returns true if this instruction projects from an address type to an
   /// address subtype.
-  static SingleValueInstruction *isAddressProjection(SILValue V) {
-    switch (V->getKind()) {
+  static SingleValueInstruction *isAddressProjection(SILValue v) {
+    switch (v->getKind()) {
     default:
       return nullptr;
     case ValueKind::IndexAddrInst: {
-      auto I = cast<IndexAddrInst>(V);
-      unsigned Scalar;
-      if (getIntegerIndex(I->getIndex(), Scalar))
-        return I;
+      auto *i = cast<IndexAddrInst>(v);
+      unsigned scalar;
+      if (getIntegerIndex(i->getIndex(), scalar))
+        return i;
       return nullptr;
     }
     case ValueKind::StructElementAddrInst:
@@ -389,8 +368,15 @@ public:
     case ValueKind::ProjectBoxInst:
     case ValueKind::TupleElementAddrInst:
     case ValueKind::UncheckedTakeEnumDataAddrInst:
-      return cast<SingleValueInstruction>(V);
+      return cast<SingleValueInstruction>(v);
     }
+  }
+
+  static SingleValueInstruction *isAddressProjection(SILInstruction *i) {
+    auto *svi = dyn_cast<SingleValueInstruction>(i);
+    if (!svi)
+      return nullptr;
+    return isAddressProjection(SILValue(svi));
   }
 
   /// Returns true if this instruction projects from an object type to an object
@@ -602,7 +588,7 @@ public:
 
   /// Return true if the given projection paths in \p CPaths does not cover
   /// all the fields with non-trivial semantics, false otherwise.
-  static bool hasUncoveredNonTrivials(SILType B, SILModule *Mod,
+  static bool hasUncoveredNonTrivials(SILType B, const SILFunction &F,
                                       ProjectionPathSet &CPaths);
 
   /// Returns true if the two paths have a non-empty symmetric
@@ -766,15 +752,17 @@ public:
   ~ProjectionTreeNode() = default;
   ProjectionTreeNode(const ProjectionTreeNode &) = default;
 
-  llvm::ArrayRef<unsigned> getChildProjections() {
-     return llvm::makeArrayRef(ChildProjections);
+  bool isLeaf() const { return ChildProjections.empty(); }
+
+  ArrayRef<unsigned> getChildProjections() const {
+    return llvm::makeArrayRef(ChildProjections);
   }
 
-  llvm::Optional<Projection> &getProjection() { return Proj; }
+  Optional<Projection> &getProjection() { return Proj; }
 
-  llvm::SmallVector<Operand *, 4> getNonProjUsers() const {
-    return NonProjUsers;
-  };
+  const ArrayRef<Operand *> getNonProjUsers() const {
+    return llvm::makeArrayRef(NonProjUsers);
+  }
 
   SILType getType() const { return NodeType; }
 
@@ -835,10 +823,10 @@ private:
 class ProjectionTree {
   friend class ProjectionTreeNode;
 
-  SILModule &Mod;
+  SILModule *Mod;
 
   /// The allocator we use to allocate ProjectionTreeNodes in the tree.
-  llvm::SpecificBumpPtrAllocator<ProjectionTreeNode> Allocator;
+  llvm::SpecificBumpPtrAllocator<ProjectionTreeNode> *Allocator;
 
   // A common pattern is a 3 field struct.
   llvm::SmallVector<ProjectionTreeNode *, 4> ProjectionTreeNodes;
@@ -848,10 +836,13 @@ class ProjectionTree {
 
 public:
   /// Construct a projection tree from BaseTy.
-  ProjectionTree(SILModule &Mod, SILType BaseTy);
+  ProjectionTree(SILModule &Mod, SILType BaseTy,
+                 llvm::SpecificBumpPtrAllocator<ProjectionTreeNode> &Allocator);
   /// Construct an uninitialized projection tree, which can then be
   /// initialized by initializeWithExistingTree.
-  ProjectionTree(SILModule &Mod) : Mod(Mod) {}
+  ProjectionTree(SILModule &Mod,
+                 llvm::SpecificBumpPtrAllocator<ProjectionTreeNode> &Allocator)
+      : Mod(&Mod), Allocator(&Allocator) {}
   ~ProjectionTree();
   ProjectionTree(const ProjectionTree &) = delete;
   ProjectionTree(ProjectionTree &&) = default;
@@ -873,7 +864,7 @@ public:
                                              LeafValueMapTy &LeafValues);
 
   /// Return the module associated with this tree.
-  SILModule &getModule() const { return Mod; }
+  SILModule &getModule() const { return *Mod; }
 
   llvm::ArrayRef<ProjectionTreeNode *> getProjectionTreeNodes() {
     return llvm::makeArrayRef(ProjectionTreeNodes);
@@ -926,8 +917,25 @@ public:
     return false;
   }
 
+  void getAllLeafTypes(llvm::SmallVectorImpl<SILType> &outArray) const {
+    llvm::SmallVector<const ProjectionTreeNode *, 32> worklist;
+    worklist.push_back(getRoot());
 
-  void getLeafTypes(llvm::SmallVectorImpl<SILType> &OutArray) const {
+    while (!worklist.empty()) {
+      auto *node = worklist.pop_back_val();
+      // If we have a leaf node, add its type.
+      if (node->isLeaf()) {
+        outArray.push_back(node->getType());
+        continue;
+      }
+
+      // Otherwise, add the nodes children to the worklist.
+      transform(node->getChildProjections(), std::back_inserter(worklist),
+                [&](unsigned idx) { return getNode(idx); });
+    }
+  }
+
+  void getLiveLeafTypes(llvm::SmallVectorImpl<SILType> &OutArray) const {
     for (unsigned LeafIndex : LiveLeafIndices) {
       const ProjectionTreeNode *Node = getNode(LeafIndex);
       assert(Node->IsLive && "We are only interested in leafs that are live");
@@ -935,8 +943,8 @@ public:
     }
   }
 
-  void
-  getLeafNodes(llvm::SmallVectorImpl<const ProjectionTreeNode *> &Out) const {
+  void getLiveLeafNodes(
+      llvm::SmallVectorImpl<const ProjectionTreeNode *> &Out) const {
     for (unsigned LeafIndex : LiveLeafIndices) {
       const ProjectionTreeNode *Node = getNode(LeafIndex);
       assert(Node->IsLive && "We are only interested in leafs that are live");
@@ -945,9 +953,7 @@ public:
   }
 
   /// Return the number of live leafs in the projection.
-  size_t liveLeafCount() const {
-    return LiveLeafIndices.size();
-  }
+  unsigned getLiveLeafCount() const { return LiveLeafIndices.size(); }
 
   void createTreeFromValue(SILBuilder &B, SILLocation Loc, SILValue NewBase,
                            llvm::SmallVectorImpl<SILValue> &Leafs) const;
@@ -955,12 +961,14 @@ public:
   void
   replaceValueUsesWithLeafUses(SILBuilder &B, SILLocation Loc,
                                llvm::SmallVectorImpl<SILValue> &Leafs);
- 
+
+  void getUsers(SmallPtrSetImpl<SILInstruction *> &users) const;
+
 private:
   void createRoot(SILType BaseTy) {
     assert(ProjectionTreeNodes.empty() &&
            "Should only create root when ProjectionTreeNodes is empty");
-    auto *Node = new (Allocator.Allocate()) ProjectionTreeNode(BaseTy);
+    auto *Node = new (Allocator->Allocate()) ProjectionTreeNode(BaseTy);
     ProjectionTreeNodes.push_back(Node);
   }
 
@@ -968,8 +976,8 @@ private:
                                      SILType BaseTy,
                                      const Projection &P) {
     unsigned Index = ProjectionTreeNodes.size();
-    auto *Node = new (Allocator.Allocate()) ProjectionTreeNode(Parent, Index,
-                                                               BaseTy, P);
+    auto *Node = new (Allocator->Allocate()) ProjectionTreeNode(Parent, Index,
+                                                                BaseTy, P);
     ProjectionTreeNodes.push_back(Node);
     return ProjectionTreeNodes[Index];
   }

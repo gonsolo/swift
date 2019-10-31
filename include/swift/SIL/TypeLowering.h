@@ -31,9 +31,11 @@ namespace clang {
 
 namespace swift {
   class AnyFunctionRef;
+  enum class Bridgeability : unsigned;
   class ForeignErrorConvention;
   enum IsInitialization_t : bool;
   enum IsTake_t : bool;
+  class ModuleDecl;
   class SILBuilder;
   class SILLocation;
   class SILModule;
@@ -70,16 +72,16 @@ inline CanAnyFunctionType adjustFunctionType(CanAnyFunctionType t,
 CanSILFunctionType
 adjustFunctionType(CanSILFunctionType type, SILFunctionType::ExtInfo extInfo,
                    ParameterConvention calleeConv,
-                   Optional<ProtocolConformanceRef> witnessMethodConformance);
+                   ProtocolConformanceRef witnessMethodConformance);
 inline CanSILFunctionType
 adjustFunctionType(CanSILFunctionType type, SILFunctionType::ExtInfo extInfo,
-                   Optional<ProtocolConformanceRef> witnessMethodConformance) {
+                   ProtocolConformanceRef witnessMethodConformance) {
   return adjustFunctionType(type, extInfo, type->getCalleeConvention(),
                             witnessMethodConformance);
 }
 inline CanSILFunctionType
 adjustFunctionType(CanSILFunctionType t, SILFunctionType::Representation rep,
-                   Optional<ProtocolConformanceRef> witnessMethodConformance) {
+                   ProtocolConformanceRef witnessMethodConformance) {
   if (t->getRepresentation() == rep) return t;
   auto extInfo = t->getExtInfo().withRepresentation(rep);
   auto contextConvention = DefaultThickCalleeConvention;
@@ -96,35 +98,152 @@ enum IsDependent_t : unsigned {
   IsNotDependent = false,
   IsDependent = true
 };
-  
+
+/// Is a lowered SIL type trivial?  That is, are copies ultimately just
+/// bit-copies, and it takes no work to destroy a value?
+enum IsTrivial_t : bool {
+  IsNotTrivial = false,
+  IsTrivial = true
+};
+
+/// Is a lowered SIL type fixed-ABI?  That is, can the current context
+/// assign it a fixed size and alignment and perform value operations on it
+/// (such as copies, destroys, constructions, and projections) without
+/// metadata?
+///
+/// Note that a fully concrete type can be non-fixed-ABI without being
+/// itself resilient if it contains a subobject which is not fixed-ABI.
+///
+/// Also note that we're only concerned with the external value ABI here:
+/// resilient class types are still fixed-ABI, indirect enum cases do not
+/// affect the fixed-ABI-ness of the enum, and so on.
+enum IsFixedABI_t : bool {
+  IsNotFixedABI = false,
+  IsFixedABI = true
+};
+
+/// Is a lowered SIL type address-only?  That is, is the current context
+/// required to keep the value in memory for some reason?
+///
+/// A type might be address-only because:
+///
+///   - it is not fixed-size (e.g. because it is a resilient type) and
+///     therefore cannot be loaded into a statically-boundable set of
+///     registers; or
+///
+///   - it is semantically bound to memory, either because its storage
+///     address is used by the language runtime to implement its semantics
+///     (as with a weak reference) or because its representation is somehow
+///     address-dependent (as with something like a relative pointer).
+///
+/// An address-only type can be fixed-layout and/or trivial.
+/// A non-fixed-layout type is always address-only.
+enum IsAddressOnly_t : bool {
+  IsNotAddressOnly = false,
+  IsAddressOnly = true
+};
+
+/// Is this type somewhat like a reference-counted type?
+enum IsReferenceCounted_t : bool {
+  IsNotReferenceCounted = false,
+  IsReferenceCounted = true
+};
+
+/// Is this type address only because it's resilient?
+enum IsResilient_t : bool {
+  IsNotResilient = false,
+  IsResilient = true
+};
+
 /// Extended type information used by SIL.
 class TypeLowering {
 public:
-  enum IsTrivial_t : bool { IsNotTrivial, IsTrivial };
-  enum IsAddressOnly_t : bool { IsNotAddressOnly, IsAddressOnly };
-  enum IsReferenceCounted_t : bool {
-    IsNotReferenceCounted,
-    IsReferenceCounted
+  class RecursiveProperties {
+    // These are chosen so that bitwise-or merges the flags properly.
+    enum : unsigned {
+      NonTrivialFlag     = 1 << 0,
+      NonFixedABIFlag    = 1 << 1,
+      AddressOnlyFlag    = 1 << 2,
+      ResilientFlag      = 1 << 3,
+    };
+
+    uint8_t Flags;
+  public:
+    /// Construct a default RecursiveProperties, which corresponds to
+    /// a trivial, loadable, fixed-layout type.
+    constexpr RecursiveProperties() : Flags(0) {}
+
+    constexpr RecursiveProperties(IsTrivial_t isTrivial,
+                                  IsFixedABI_t isFixedABI,
+                                  IsAddressOnly_t isAddressOnly,
+                                  IsResilient_t isResilient)
+      : Flags((isTrivial ? 0U : NonTrivialFlag) | 
+              (isFixedABI ? 0U : NonFixedABIFlag) |
+              (isAddressOnly ? AddressOnlyFlag : 0U) |
+              (isResilient ? ResilientFlag : 0U)) {}
+
+    static constexpr RecursiveProperties forTrivial() {
+      return {IsTrivial, IsFixedABI, IsNotAddressOnly, IsNotResilient};
+    }
+
+    static constexpr RecursiveProperties forReference() {
+      return {IsNotTrivial, IsFixedABI, IsNotAddressOnly, IsNotResilient };
+    }
+
+    static constexpr RecursiveProperties forOpaque() {
+      return {IsNotTrivial, IsNotFixedABI, IsAddressOnly, IsNotResilient};
+    }
+
+    static constexpr RecursiveProperties forResilient() {
+      return {IsTrivial, IsFixedABI, IsNotAddressOnly, IsResilient};
+    }
+
+    void addSubobject(RecursiveProperties other) {
+      Flags |= other.Flags;
+    }
+
+    IsTrivial_t isTrivial() const {
+      return IsTrivial_t((Flags & NonTrivialFlag) == 0);
+    }
+    IsFixedABI_t isFixedABI() const {
+      return IsFixedABI_t((Flags & NonFixedABIFlag) == 0);
+    }
+    IsAddressOnly_t isAddressOnly() const {
+      return IsAddressOnly_t((Flags & AddressOnlyFlag) != 0);
+    }
+    IsResilient_t isResilient() const {
+      return IsResilient_t((Flags & ResilientFlag) != 0);
+    }
+
+    void setNonTrivial() { Flags |= NonTrivialFlag; }
+    void setNonFixedABI() { Flags |= NonFixedABIFlag; }
+    void setAddressOnly() { Flags |= AddressOnlyFlag; }
   };
 
 private:
+  friend class TypeConverter;
+
   /// The SIL type of values with this Swift type.
   SILType LoweredType;
 
-  enum : unsigned {
-    IsTrivialFlag     = 0x1,
-    IsAddressOnlyFlag = 0x2,
-    IsReferenceCountedFlag = 0x4,
-  };
-  unsigned Flags;
+  RecursiveProperties Properties;
+  unsigned ReferenceCounted : 1;
 
-protected:  
-  TypeLowering(SILType type, IsTrivial_t isTrivial,
-               IsAddressOnly_t isAddressOnly,
-               IsReferenceCounted_t isRefCounted)
-    : LoweredType(type), Flags((isTrivial ? IsTrivialFlag : 0U) | 
-                               (isAddressOnly ? IsAddressOnlyFlag : 0U) |
-                               (isRefCounted ? IsReferenceCountedFlag : 0U)) {}
+  /// The resilience expansion for this type lowering.
+  /// If the type is not resilient at all, this is always Minimal.
+  unsigned ForExpansion : 1;
+
+  /// A single linked list of lowerings for different resilience expansions.
+  /// The first lowering is always for ResilientExpansion::Minimal.
+  mutable const TypeLowering *NextExpansion = nullptr;
+
+protected:
+  TypeLowering(SILType type, RecursiveProperties properties,
+               IsReferenceCounted_t isRefCounted,
+               ResilienceExpansion forExpansion)
+    : LoweredType(type), Properties(properties),
+      ReferenceCounted(isRefCounted),
+      ForExpansion(unsigned(forExpansion)) {}
 
 public:
   TypeLowering(const TypeLowering &) = delete;
@@ -132,23 +251,43 @@ public:
 
   virtual ~TypeLowering() {}
 
-  /// \brief Are r-values of this type passed as arguments indirectly by formal
+  /// Print out the internal state of this type lowering into \p os.
+  void print(llvm::raw_ostream &os) const;
+
+  /// Dump out the internal state of this type lowering to llvm::dbgs().
+  LLVM_ATTRIBUTE_DEPRECATED(void dump() const, "Only for use in the debugger");
+
+  /// Are r-values of this type passed as arguments indirectly by formal
   /// convention?
   ///
   /// This is independent of whether the SIL argument is address type.
-  bool isFormallyPassedIndirectly() const { return isAddressOnly(); }
+  bool isFormallyPassedIndirectly() const {
+    assert(!isResilient() ||
+           getResilienceExpansion() == ResilienceExpansion::Minimal &&
+           "calling convention uses minimal resilience expansion");
+    return isAddressOnly();
+  }
 
-  /// \brief Are r-values of this type returned indirectly by formal convention?
+  /// Are r-values of this type returned indirectly by formal convention?
   ///
   /// This is independent of whether the SIL result is address type.
-  bool isFormallyReturnedIndirectly() const { return isAddressOnly(); }
+  bool isFormallyReturnedIndirectly() const {
+    assert(!isResilient() ||
+           getResilienceExpansion() == ResilienceExpansion::Minimal &&
+           "calling convention uses minimal resilience expansion");
+    return isAddressOnly();
+  }
+
+  RecursiveProperties getRecursiveProperties() const {
+    return Properties;
+  }
 
   /// isAddressOnly - Returns true if the type is an address-only type. A type
   /// is address-only if it is a resilient value type, or if it is a fragile
   /// value type with a resilient member. In either case, the full layout of
   /// values of the type is unavailable to the compiler.
   bool isAddressOnly() const {
-    return Flags & IsAddressOnlyFlag;
+    return Properties.isAddressOnly();
   }
   /// isLoadable - Returns true if the type is loadable, in other words, its
   /// full layout is available to the compiler. This is the inverse of
@@ -156,17 +295,24 @@ public:
   bool isLoadable() const {
     return !isAddressOnly();
   }
+
+  /// isFixedABI - Returns true if the type has a known fixed layout.
+  /// If this is true, value operations on the type can be performed even if
+  /// the type is inaccessible.
+  bool isFixedABI() const {
+    return Properties.isFixedABI();
+  }
   
   /// Returns true if the type is trivial, meaning it is a loadable
   /// value type with no reference type members that require releasing.
   bool isTrivial() const {
-    return Flags & IsTrivialFlag;
+    return Properties.isTrivial();
   }
   
   /// Returns true if the type is a scalar reference-counted reference, which
   /// can be retained and released.
   bool isReferenceCounted() const {
-    return Flags & IsReferenceCountedFlag;
+    return ReferenceCounted;
   }
 
   /// getLoweredType - Get the type used to represent values of the Swift type
@@ -180,22 +326,13 @@ public:
     return LoweredType.isAddress();
   }
 
-  /// Return the semantic type.
-  ///
-  /// The semantic type is what a type pretends to be during
-  /// type-checking: that is, the type that getTypeOfRValue would
-  /// return on a variable of this type.
-  SILType getSemanticType() const {
-    // If you change this, change getSemanticTypeLowering() too.
-    auto storageType = getLoweredType().getASTType();
-    if (auto refType = dyn_cast<ReferenceStorageType>(storageType))
-      return SILType::getPrimitiveType(refType.getReferentType(),
-                                       SILValueCategory::Object);
-    return getLoweredType();
+  bool isResilient() const {
+    return Properties.isResilient();
   }
-  
-  /// Return the lowering for the semantic type.
-  inline const TypeLowering &getSemanticTypeLowering(TypeConverter &TC) const;
+
+  ResilienceExpansion getResilienceExpansion() const {
+    return ResilienceExpansion(ForExpansion);
+  }
 
   /// Produce an exact copy of the value in the given address as a
   /// scalar.  The caller is responsible for destroying this value,
@@ -377,6 +514,7 @@ public:
     case TypeExpansionKind::MostDerivedDescendents:
       return emitLoweredCopyValueMostDerivedDescendents(B, loc, value);
     }
+    llvm_unreachable("unhandled style");
   }
 
   /// Allocate a new TypeLowering using the TypeConverter's allocator.
@@ -411,20 +549,15 @@ struct SILConstantInfo {
 
   /// The SIL function type of the constant.
   CanSILFunctionType SILFnType;
-  
-  /// The generic environment used by the constant.
-  GenericEnvironment *GenericEnv;
 
   SILConstantInfo(CanAnyFunctionType formalType,
                   AbstractionPattern formalPattern,
                   CanAnyFunctionType loweredType,
-                  CanSILFunctionType silFnTy,
-                  GenericEnvironment *env)
+                  CanSILFunctionType silFnTy)
     : FormalType(formalType),
       FormalPattern(formalPattern),
       LoweredType(loweredType),
-      SILFnType(silFnTy),
-      GenericEnv(env) {}
+      SILFnType(silFnTy) {}
   
   SILType getSILType() const {
     return SILType::getPrimitiveObjectType(SILFnType);
@@ -433,8 +566,7 @@ struct SILConstantInfo {
   friend bool operator==(SILConstantInfo lhs, SILConstantInfo rhs) {
     return lhs.FormalType == rhs.FormalType &&
            lhs.LoweredType == rhs.LoweredType &&
-           lhs.SILFnType == rhs.SILFnType &&
-           lhs.GenericEnv == rhs.GenericEnv;
+           lhs.SILFnType == rhs.SILFnType;
   }
   friend bool operator!=(SILConstantInfo lhs, SILConstantInfo rhs) {
     return !(lhs == rhs);
@@ -443,8 +575,6 @@ struct SILConstantInfo {
 
 /// Different ways in which a function can capture context.
 enum class CaptureKind {
-  /// No context arguments are necessary.
-  None,
   /// A local value captured as a mutable box.
   Box,
   /// A local value captured as a single pointer to storage (formed with
@@ -461,15 +591,8 @@ class TypeConverter {
 
   llvm::BumpPtrAllocator IndependentBPA;
 
-  enum : unsigned {
-    /// There is a unique entry with this uncurry level in the
-    /// type-lowering map for every TLI we create.  The map has the
-    /// responsibility to call the destructor for these entries.
-    UniqueLoweringEntry = ~0U
-  };
-
   struct CachingTypeKey {
-    GenericSignature *Sig;
+    CanGenericSignature Sig;
     AbstractionPattern::CachingKey OrigType;
     CanType SubstType;
 
@@ -566,35 +689,41 @@ class TypeConverter {
   
   llvm::DenseMap<OverrideKey, SILConstantInfo *> ConstantOverrideTypes;
 
-  llvm::DenseMap<AnyFunctionRef, CaptureInfo> LoweredCaptures;
+  llvm::DenseMap<SILDeclRef, CaptureInfo> LoweredCaptures;
 
   /// Cache of loadable SILType to number of (estimated) fields
-  llvm::DenseMap<SILType, unsigned> TypeFields;
+  ///
+  /// Second element is a ResilienceExpansion.
+  llvm::DenseMap<std::pair<SILType, unsigned>, unsigned> TypeFields;
 
   CanAnyFunctionType makeConstantInterfaceType(SILDeclRef constant);
-  
-  /// Get the generic environment for a constant.
-  GenericEnvironment *getConstantGenericEnvironment(SILDeclRef constant);
   
   // Types converted during foreign bridging.
 #define BRIDGING_KNOWN_TYPE(BridgedModule,BridgedType) \
   Optional<CanType> BridgedType##Ty;
 #include "swift/SIL/BridgedTypes.def"
 
-  const TypeLowering &getTypeLoweringForLoweredType(TypeKey key);
-  const TypeLowering &getTypeLoweringForUncachedLoweredType(TypeKey key);
+  const TypeLowering &
+  getTypeLoweringForLoweredType(TypeKey key,
+                                ResilienceExpansion forExpansion);
+
+  const TypeLowering *
+  getTypeLoweringForExpansion(TypeKey key,
+                              ResilienceExpansion forExpansion,
+                              const TypeLowering *lowering);
 
 public:
-  SILModule &M;
+  ModuleDecl &M;
   ASTContext &Context;
 
-  TypeConverter(SILModule &m);
+  TypeConverter(ModuleDecl &m);
   ~TypeConverter();
   TypeConverter(TypeConverter const &) = delete;
   TypeConverter &operator=(TypeConverter const &) = delete;
 
   /// Return the CaptureKind to use when capturing a decl.
-  CaptureKind getDeclCaptureKind(CapturedValue capture);
+  CaptureKind getDeclCaptureKind(CapturedValue capture,
+                                 ResilienceExpansion expansion);
 
   /// Return a most-general-possible abstraction pattern.
   AbstractionPattern getMostGeneralAbstraction() {
@@ -619,7 +748,7 @@ public:
   static ProtocolDispatchStrategy getProtocolDispatchStrategy(ProtocolDecl *P);
 
   /// Count the total number of fields inside the given SIL Type
-  unsigned countNumberOfFields(SILType Ty);
+  unsigned countNumberOfFields(SILType Ty, ResilienceExpansion expansion);
 
   /// True if a protocol uses witness tables for dynamic dispatch.
   static bool protocolRequiresWitnessTable(ProtocolDecl *P) {
@@ -644,55 +773,68 @@ public:
   
   /// Lowers a Swift type to a SILType, and returns the SIL TypeLowering
   /// for that type.
-  const TypeLowering &getTypeLowering(Type t) {
+  const TypeLowering &
+  getTypeLowering(Type t, ResilienceExpansion forExpansion) {
     AbstractionPattern pattern(getCurGenericContext(), t->getCanonicalType());
-    return getTypeLowering(pattern, t);
+    return getTypeLowering(pattern, t, forExpansion);
   }
 
   /// Lowers a Swift type to a SILType according to the abstraction
   /// patterns of the given original type.
   const TypeLowering &getTypeLowering(AbstractionPattern origType,
-                                      Type substType);
+                                      Type substType,
+                                      ResilienceExpansion forExpansion);
 
   /// Returns the SIL TypeLowering for an already lowered SILType. If the
   /// SILType is an address, returns the TypeLowering for the pointed-to
   /// type.
-  const TypeLowering &getTypeLowering(SILType t);
+  const TypeLowering &
+  getTypeLowering(SILType t, ResilienceExpansion forExpansion);
 
   // Returns the lowered SIL type for a Swift type.
-  SILType getLoweredType(Type t) {
-    return getTypeLowering(t).getLoweredType();
+  SILType getLoweredType(Type t, ResilienceExpansion forExpansion) {
+    return getTypeLowering(t, forExpansion).getLoweredType();
   }
 
   // Returns the lowered SIL type for a Swift type.
-  SILType getLoweredType(AbstractionPattern origType, Type substType) {
-    return getTypeLowering(origType, substType).getLoweredType();
+  SILType getLoweredType(AbstractionPattern origType, Type substType,
+                         ResilienceExpansion forExpansion) {
+    return getTypeLowering(origType, substType, forExpansion)
+      .getLoweredType();
   }
 
-  SILType getLoweredLoadableType(Type t) {
-    const TypeLowering &ti = getTypeLowering(t);
+  SILType getLoweredLoadableType(Type t,
+                                 ResilienceExpansion forExpansion,
+                                 SILModule &M) {
+    const TypeLowering &ti = getTypeLowering(t, forExpansion);
     assert(
         (ti.isLoadable() || !SILModuleConventions(M).useLoweredAddresses()) &&
         "unexpected address-only type");
     return ti.getLoweredType();
   }
 
-  AbstractionPattern getAbstractionPattern(AbstractStorageDecl *storage);
-  AbstractionPattern getAbstractionPattern(VarDecl *var);
-  AbstractionPattern getAbstractionPattern(SubscriptDecl *subscript);
-  AbstractionPattern getIndicesAbstractionPattern(SubscriptDecl *subscript);
+  CanType getLoweredRValueType(Type t) {
+    // We're ignoring the category (object vs address), so the resilience
+    // expansion does not matter.
+    return getLoweredType(t, ResilienceExpansion::Minimal).getASTType();
+  }
+
+  CanType getLoweredRValueType(AbstractionPattern origType, Type substType) {
+    // We're ignoring the category (object vs address), so the resilience
+    // expansion does not matter.
+    return getLoweredType(origType, substType,
+                          ResilienceExpansion::Minimal).getASTType();
+  }
+
+  AbstractionPattern getAbstractionPattern(AbstractStorageDecl *storage,
+                                           bool isNonObjC = false);
+  AbstractionPattern getAbstractionPattern(VarDecl *var,
+                                           bool isNonObjC = false);
+  AbstractionPattern getAbstractionPattern(SubscriptDecl *subscript,
+                                           bool isNonObjC = false);
   AbstractionPattern getAbstractionPattern(EnumElementDecl *element);
 
-  SILType getLoweredTypeOfGlobal(VarDecl *var);
-
-  /// The return type of a materializeForSet contains a callback
-  /// whose type cannot be represented in the AST because it is
-  /// a polymorphic function value. This function returns the
-  /// unsubstituted lowered type of this callback.
-  CanSILFunctionType getMaterializeForSetCallbackType(
-      AbstractStorageDecl *storage, CanGenericSignature genericSig,
-      Type selfType, SILFunctionTypeRepresentation rep,
-      Optional<ProtocolConformanceRef> witnessMethodConformance);
+  CanType getLoweredTypeOfGlobal(VarDecl *var);
 
   /// Return the SILFunctionType for a native function value of the
   /// given type.
@@ -702,7 +844,13 @@ public:
   /// Returns the formal type, lowered AST type, and SILFunctionType
   /// for a constant reference.
   const SILConstantInfo &getConstantInfo(SILDeclRef constant);
-  
+
+  /// Get the generic environment for a constant.
+  GenericSignature getConstantGenericSignature(SILDeclRef constant);
+
+  /// Get the generic environment for a constant.
+  GenericEnvironment *getConstantGenericEnvironment(SILDeclRef constant);
+
   /// Returns the SIL type of a constant reference.
   SILType getConstantType(SILDeclRef constant) {
     return getConstantInfo(constant).getSILType();
@@ -748,11 +896,6 @@ public:
   SILType getEmptyTupleType() {
     return SILType::getPrimitiveObjectType(TupleType::getEmpty(Context));
   }
-  
-  /// Get a function type curried with its capture context.
-  CanAnyFunctionType getFunctionInterfaceTypeWithCaptures(
-                                              CanAnyFunctionType funcType,
-                                              AnyFunctionRef closure);
 
   /// Describes what we're trying to compute a bridged type for.
   ///
@@ -767,6 +910,7 @@ public:
   /// Map an AST-level type to the corresponding foreign representation type we
   /// implicitly convert to for a given calling convention.
   Type getLoweredBridgedType(AbstractionPattern pattern, Type t,
+                             Bridgeability bridging,
                              SILFunctionTypeRepresentation rep,
                              BridgedTypePurpose purpose);
 
@@ -787,7 +931,8 @@ public:
   /// Given a function type, yield its bridged formal type.
   CanAnyFunctionType getBridgedFunctionType(AbstractionPattern fnPattern,
                                             CanAnyFunctionType fnType,
-                                            AnyFunctionType::ExtInfo extInfo);
+                                            AnyFunctionType::ExtInfo extInfo,
+                                            Bridgeability bridging);
 
   /// Given a referenced value and the substituted formal type of a
   /// resulting l-value expression, produce the substituted formal
@@ -796,17 +941,6 @@ public:
   /// \return - always an address type
   SILType getSubstitutedStorageType(AbstractStorageDecl *value,
                                     Type lvalueType);
-
-  /// Retrieve the set of archetypes closed over by the given function.
-  GenericEnvironment *getEffectiveGenericEnvironment(AnyFunctionRef fn,
-                                                     CaptureInfo captureInfo);
-
-  /// Retrieve the set of generic parameters closed over by the given function.
-  CanGenericSignature getEffectiveGenericSignature(AnyFunctionRef fn,
-                                                   CaptureInfo captureInfo);
-
-  /// Retrieve the set of generic parameters closed over by the context.
-  CanGenericSignature getEffectiveGenericSignature(DeclContext *dc);
 
   /// Push a generic function context. See GenericContextScope for an RAII
   /// interface to this function.
@@ -833,10 +967,28 @@ public:
   CanType get##BridgedType##Type();
 #include "swift/SIL/BridgedTypes.def"
 
-  /// Get the capture list from a closure, with transitive function captures
-  /// flattened.
-  CaptureInfo getLoweredLocalCaptures(AnyFunctionRef fn);
-  bool hasLoweredLocalCaptures(AnyFunctionRef fn);
+  /// Get the capture list for a function or default argument, with transitive
+  /// function captures flattened.
+  CaptureInfo getLoweredLocalCaptures(SILDeclRef fn);
+  bool hasLoweredLocalCaptures(SILDeclRef fn);
+
+#ifndef NDEBUG
+  /// If \c false, \c childDC is in a context it cannot capture variables from,
+  /// so it is expected that Sema may not have computed its \c CaptureInfo.
+  ///
+  /// This call exists for use in assertions; do not use it to skip capture
+  /// processing.
+  static bool canCaptureFromParent(DeclContext *childDC) {
+    // This call was added because Sema leaves the captures of functions that
+    // cannot capture anything uncomputed.
+    // TODO: Make Sema set them to CaptureInfo::empty() instead.
+
+    if (childDC)
+      if (auto decl = childDC->getAsDecl())
+         return decl->getDeclContext()->isLocalContext();
+    return true;
+  }
+#endif
 
   enum class ABIDifference : uint8_t {
     // No ABI differences, function can be trivially bitcast to result type.
@@ -847,7 +999,7 @@ public:
     NeedsThunk
   };
   
-  /// \brief Test if type1 is ABI compatible with type2, and can be converted
+  /// Test if type1 is ABI compatible with type2, and can be converted
   /// with a trivial bitcast.
   ///
   /// Note that type1 and type2 must be lowered types, and type1 must be a
@@ -856,11 +1008,13 @@ public:
   /// The ABI compatible relation is not symmetric on function types -- while
   /// T and T! are both subtypes of each other, a calling convention conversion
   /// of T! to T always requires a thunk.
-  ABIDifference checkForABIDifferences(SILType type1, SILType type2,
+  ABIDifference checkForABIDifferences(SILModule &M,
+                                       SILType type1, SILType type2,
                                        bool thunkOptionals = true);
 
-  /// \brief Same as above but for SIL function types.
-  ABIDifference checkFunctionForABIDifferences(SILFunctionType *fnTy1,
+  /// Same as above but for SIL function types.
+  ABIDifference checkFunctionForABIDifferences(SILModule &M,
+                                               SILFunctionType *fnTy1,
                                                SILFunctionType *fnTy2);
 
 
@@ -888,30 +1042,32 @@ public:
                                          EnumElementDecl *elt);
 
 private:
-  CanType getLoweredRValueType(AbstractionPattern origType, CanType substType);
+  CanType computeLoweredRValueType(AbstractionPattern origType,
+                                   CanType substType);
 
   Type getLoweredCBridgedType(AbstractionPattern pattern, Type t,
-                              bool canBridgeBool,
-                              bool bridgedCollectionsAreOptional);
+                              Bridgeability bridging,
+                              SILFunctionTypeRepresentation rep,
+                              BridgedTypePurpose purpose);
 
-  CanType getBridgedInputType(SILFunctionTypeRepresentation rep,
-                              AbstractionPattern pattern,
-                              CanType input);
+  AnyFunctionType::Param
+  getBridgedParam(SILFunctionTypeRepresentation rep,
+                  AbstractionPattern pattern,
+                  AnyFunctionType::Param param,
+                  Bridgeability bridging);
+
+  void getBridgedParams(SILFunctionTypeRepresentation rep,
+                        AbstractionPattern pattern,
+                        ArrayRef<AnyFunctionType::Param> params,
+                        SmallVectorImpl<AnyFunctionType::Param> &bridged,
+                        Bridgeability bridging);
 
   CanType getBridgedResultType(SILFunctionTypeRepresentation rep,
                                AbstractionPattern pattern,
                                CanType result,
+                               Bridgeability bridging,
                                bool suppressOptional);
 };
-
-inline const TypeLowering &
-TypeLowering::getSemanticTypeLowering(TypeConverter &TC) const {
-  // If you change this, change getSemanticType() too.
-  auto storageType = getLoweredType().getASTType();
-  if (auto refType = dyn_cast<ReferenceStorageType>(storageType))
-    return TC.getTypeLowering(refType.getReferentType());
-  return *this;
-}
 
 /// RAII interface to push a generic context.
 class GenericContextScope {
@@ -954,7 +1110,7 @@ namespace llvm {
     }
     static unsigned getHashValue(CachingTypeKey val) {
       auto hashSig =
-        DenseMapInfo<swift::GenericSignature *>::getHashValue(val.Sig);
+        DenseMapInfo<swift::GenericSignature>::getHashValue(val.Sig);
       auto hashOrig =
         CachingKeyInfo::getHashValue(val.OrigType);
       auto hashSubst =

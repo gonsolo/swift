@@ -21,14 +21,15 @@ public let DictionaryKeysContains = [
     name: "DictionaryKeysContainsNative",
     runFunction: run_DictionaryKeysContains,
     tags: [.validation, .api, .Dictionary],
-    setUpFunction: setup_DictionaryKeysContainsNative,
-    tearDownFunction: teardown_DictionaryKeysContains),
+    setUpFunction: setupNativeDictionary,
+    tearDownFunction: teardownDictionary,
+    unsupportedPlatforms: [.linux]),
   BenchmarkInfo(
     name: "DictionaryKeysContainsCocoa",
     runFunction: run_DictionaryKeysContains,
     tags: [.validation, .api, .Dictionary],
-    setUpFunction: setup_DictionaryKeysContainsCocoa,
-    tearDownFunction: teardown_DictionaryKeysContains),
+    setUpFunction: setupBridgedDictionary,
+    tearDownFunction: teardownDictionary),
 ]
 #else
 public let DictionaryKeysContains = [
@@ -36,41 +37,45 @@ public let DictionaryKeysContains = [
     name: "DictionaryKeysContainsNative",
     runFunction: run_DictionaryKeysContains,
     tags: [.validation, .api, .Dictionary],
-    setUpFunction: setup_DictionaryKeysContainsNative,
-    tearDownFunction: teardown_DictionaryKeysContains),
+    setUpFunction: setupNativeDictionary,
+    tearDownFunction: teardownDictionary,
+    unsupportedPlatforms: [.linux]),
 ]
 #endif
 
 private var dictionary: [NSString: NSString]!
 
-private func setup_DictionaryKeysContainsNative() {
-  let keyValuePairs = (1...1_000_000).map {
-    ("\($0)" as NSString, "\($0)" as NSString)
+private func setupNativeDictionary() {
+#if os(Linux)
+  fatalError("Unsupported benchmark")
+#else
+  let keyValuePair: (Int) -> (NSString, NSString) = {
+    let n = "\($0)" as NSString; return (n, n)
   }
-  dictionary = [NSString: NSString](uniqueKeysWithValues: keyValuePairs)
+  dictionary = [NSString: NSString](uniqueKeysWithValues:
+    (1...10_000).lazy.map(keyValuePair))
+#endif
 }
 
 #if _runtime(_ObjC)
-private func setup_DictionaryKeysContainsCocoa() {
-  let keyValuePairs = (1...1_000_000).map {
-    ("\($0)" as NSString, "\($0)" as NSString)
-  }
-  let nativeDictionary = [NSString: NSString](
-    uniqueKeysWithValues: keyValuePairs)
-  dictionary = (NSDictionary(dictionary: nativeDictionary)
-    as! [NSString: NSString])
+private func setupBridgedDictionary() {
+  setupNativeDictionary()
+  dictionary = (NSDictionary(dictionary: dictionary) as! [NSString: NSString])
 }
 #endif
 
-private func teardown_DictionaryKeysContains() {
+private func teardownDictionary() {
   dictionary = nil
 }
 
 @inline(never)
 public func run_DictionaryKeysContains(_ N: Int) {
+#if os(Linux)
+  fatalError("Unsupported benchmark")
+#else
   for _ in 0..<(N * 100) {
     CheckResults(dictionary.keys.contains("42"))
     CheckResults(!dictionary.keys.contains("-1"))
   }
+#endif
 }
-
