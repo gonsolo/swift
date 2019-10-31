@@ -1,16 +1,64 @@
+name: swift
+version: '5.1.1'
+summary: The Swift Programming Language
+description: |
+  Swift is a high-performance system programming language. It has a clean and
+  modern syntax, offers seamless access to existing C and Objective-C code and
+  frameworks, and is memory safe by default.
 
-  name: swift5
-  version: '5.1.1' # just for humans, typically '1.2+git' or '1.3.2'
-  summary: The Swift Programming Language
-  description: |
-    Swift is a general-purpose programming language built using a modern
-    approach to safety, performance, and software design patterns.
+confinement: strict
+grade: devel
 
-  grade: stable # must be 'stable' to release into candidate/stable channels
-  confinement: devmode # use 'strict' once you have the right plugs and slots
-
-  parts:
-    my-part:
-      # See 'snapcraft plugins'
-      plugin: nil
-  
+parts:
+  swift:
+    source: https://swift.org/builds/swift-5.1.1-release/ubuntu1804/swift-5.1.1-RELEASE/swift-5.1.1-RELEASE-ubuntu18.04.tar.gz
+    stage-packages:
+      - clang
+      - libblocksruntime0
+      - libbsd0
+      - libedit2
+      - libicu-dev          # Yes, the -dev package is deliberately staged.
+      - libncursesw5
+      - libpython2.7
+      - libsqlite3-0
+      - libuutil1linux
+      - libxml2
+      - python2.7
+      - libcurl3
+      - libatomic1
+    stage:
+      - usr/lib/*
+    prime:
+      - usr/lib/*
+      
+apps:
+  lldb:
+    command: bin/lldb
+  lldb-argdumper:
+    command: bin/lldb-argdumper
+  lldb-mi:
+    command: bin/lldb-mi
+  lldb-server:
+    command: bin/lldb-server
+  repl-swift:
+    command: bin/repl_swift
+  swift:
+    command: bin/swift
+  swift-autolink-extract:
+    command: bin/swift-autolink-extract
+  swift-build:
+    command: bin/swift-build
+  swift-build-tool:
+    command: bin/swift-build-tool
+  swift-demangle:
+    command: bin/swift-demangle
+  swift-package:
+    command: bin/swift-package
+  swift-test:
+    command: bin/swift-test
+  swiftc:
+    command: bin/swiftc
+  swift-run:
+    command: bin/swift-run
+  swift-format:
+    command: bin/swift-format
