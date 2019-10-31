@@ -9,6 +9,10 @@ description: |
 confinement: strict
 grade: devel
 
+architectures:
+  - build-on: amd64
+    run-on: amd64
+
 parts:
   swift5:
     source: https://swift.org/builds/swift-5.1.1-release/ubuntu1804/swift-5.1.1-RELEASE/swift-5.1.1-RELEASE-ubuntu18.04.tar.gz
